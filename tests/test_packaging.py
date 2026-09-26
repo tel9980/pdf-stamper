@@ -81,6 +81,16 @@ def _non_docstring_strings(tree):
     return strings
 
 
+def _string_list_assign(tree, name):
+    """收集模块级 `NAME = ["a", "b", ...]` 列表字面量里的字符串元素（返回集合）。"""
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Assign)
+                and any(isinstance(t, ast.Name) and t.id == name for t in node.targets)
+                and isinstance(node.value, ast.List)):
+            return {e.value for e in node.value.elts if isinstance(e, ast.Constant)}
+    return None
+
+
 class TestIconAssets(unittest.TestCase):
 
     def test_ico_exists_and_valid(self):
@@ -142,6 +152,16 @@ class TestBuildExeArgs(unittest.TestCase):
         self.assertIn("--icon=", self.source, "缺少 --icon 参数")
         self.assertIn("stamp.ico", self.source, "--icon 应指向 assets/stamp.ico")
 
+    def test_exclude_modules_declared(self):
+        """EXE 瘦身：重包排除清单存在，且确实挂到了 cmd 上。"""
+        self.assertIn("--exclude-module=", self.source, "cmd 应挂上 --exclude-module 参数")
+        excludes = _string_list_assign(self.tree, "EXCLUDE_MODULES")
+        self.assertIsNotNone(excludes, "缺少模块级 EXCLUDE_MODULES 列表")
+        heavy = {"scipy", "pandas", "numpy", "matplotlib",
+                 "sqlalchemy", "setuptools", "pytest", "_pytest"}
+        self.assertTrue(heavy.issubset(excludes),
+                        f"未排除的重包: {sorted(heavy - excludes)}")
+
     def test_entry_script_still_bundled(self):
         literals = _cmd_list_literals(self.tree)
         self.assertIn("pdf_stamper.py", literals, "cmd 参数列表应包含入口脚本本身")
@@ -192,6 +212,19 @@ class TestSpecConsistency(unittest.TestCase):
     def test_spec_hiddenimports_match(self):
         for mod in ("PIL._tkinter_finder", "PIL.Image", "PIL.ImageTk"):
             self.assertIn(mod, self.source, f"spec 缺少 hiddenimport: {mod}")
+
+    def test_spec_excludes_match_build_script(self):
+        """手调 spec 的 excludes 应与 build_exe.py 的 EXCLUDE_MODULES 完全一致。"""
+        spec_excludes = None
+        for node in ast.walk(ast.parse(self.source)):
+            if isinstance(node, ast.keyword) and node.arg == "excludes" \
+                    and isinstance(node.value, ast.List):
+                spec_excludes = {e.value for e in node.value.elts if isinstance(e, ast.Constant)}
+                break
+        build_excludes = _string_list_assign(ast.parse(_read(BUILD_EXE)), "EXCLUDE_MODULES")
+        self.assertIsNotNone(spec_excludes, "spec 的 Analysis 缺少 excludes 列表")
+        self.assertEqual(spec_excludes, build_excludes,
+                         "spec 与 build_exe.py 的排除清单不一致（build_exe.py 是单一来源）")
 
 
 if __name__ == "__main__":

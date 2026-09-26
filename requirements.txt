@@ -1,3 +1,6 @@
-﻿PyMuPDF>=1.23.0
-Pillow>=9.0.0
-pyinstaller>=5.0.0
+﻿# ===== PDF盖章工具 依赖（v3.1 实测环境：Python 3.14.2 + 下列精确版本）=====
+# 应用型项目按实测版本精确钉死，保证本地开发与 EXE 打包可复现；
+# 升级任一依赖后必须重跑：python test_core.py 与 python -m unittest discover -s tests。
+PyMuPDF==1.28.2       # 代码用 `import pymupdf as fitz`（pymupdf 别名自 1.24.0 提供，旧版自动回退 fitz）
+Pillow==12.1.0        # 测试已避开 Image.getdata（Pillow 14 将移除该 API）
+pyinstaller==6.21.0   # 打包参数单一来源是 build_exe.py

@@ -22,6 +22,29 @@ APP_NAME = "PDF盖章工具"
 ENTRY_SCRIPT = "pdf_stamper.py"
 ICON_PATH = os.path.join("assets", "stamp.ico")
 
+# 打包时排除的重包：本工具的代码路径完全用不到，却被 PyInstaller 的分析钩子
+# 顺手扫进 PYZ（scipy / pandas / sqlalchemy / numpy / setuptools / matplotlib / pytest
+# 合计上千个模块，是 EXE 体积的主因）。排除后必须重新验证：
+#   python build_exe.py  ->  python -m unittest tests.test_packaging -v  ->  启动冒烟
+EXCLUDE_MODULES = [
+    "scipy",
+    "pandas",
+    "numpy",
+    "matplotlib",
+    "sqlalchemy",
+    "setuptools",
+    "pkg_resources",
+    "pytest",
+    "_pytest",
+    "lxml",
+    "pygments",
+    "IPython",
+    "openpyxl",
+    "jinja2",
+    "dateutil",
+    "pytz",
+]
+
 
 def output_name_for_platform():
     """按平台返回 dist 下的产物名（Windows: .exe / Mac: .app / Linux: 无后缀）。"""
@@ -116,6 +139,7 @@ def main():
         "--hidden-import=PIL.ImageTk",
     ]
     cmd += icon_args
+    cmd += [f"--exclude-module={name}" for name in EXCLUDE_MODULES]
     cmd.append(ENTRY_SCRIPT)
 
     print("\n开始打包...")
