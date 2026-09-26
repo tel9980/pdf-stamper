@@ -1,0 +1,348 @@
+# PDF盖章工具 - 项目说明
+
+> 这份文档只描述**磁盘上真实存在的代码**，并且区分两个基准，避免「文档比代码慢」：
+>
+> | 基准 | 是什么 | 在本文里的可信度 |
+> |------|--------|------------------|
+> | **A. v3.0 快照** | `backup/pdf_stamper.v3.0.orig.py`，750 行 / 29735 字节，与本次核对时读到的 `pdf_stamper.py` 内容一致 | **已确认**。文中所有行号指的是这个快照，随时可复核 |
+> | **B. v3.1 工作副本** | 当前 `E:\AI\pdf_stamper.py`（窗口标题已写 v3.1；本次核对时约 1800 行，几分钟内已从 1789 涨到 1797 行），另有 `tests\`、`assets\`、改过的 `build_exe.py`、`PDF盖章工具.spec` | **修复中、未验收**。由另一名开发同步改动，内容仍在变动 |
+>
+> 因此：**本文所有行号只指向 A（v3.0 快照）**；提到 B 时一律用函数/类名，不用行号。
+>
+> 规则：涉及 A–H 修复项，本文一律写「v3.1 修复中」，**不写「已修复」**。
+> 工作副本里已经能看到对应的实现思路，本文会如实转述，但结论以验收为准。
+
+---
+
+## 一、项目结构（以磁盘实际内容为准）
+
+```
+E:\AI\
+├── pdf_stamper.py          # 主程序（当前为 v3.1 工作副本，v3.0 快照见 backup\）
+├── test_core.py            # 冒烟测试脚本（print 风格，无断言）306 行，未随 v3.1 改动
+├── tests\                  # 新增测试包（v3.1，未验收）
+│   ├── __init__.py
+│   └── test_packaging.py   # unittest 风格：只测打包脚本/图标/spec 一致性，不测盖章逻辑
+├── assets\                 # 新增图标资源（v3.1，未验收）
+│   ├── make_icon.py        # 图标生成脚本
+│   ├── stamp.ico           # Windows 打包用图标
+│   └── stamp_icon.png      # 256x256 预览图
+├── build_exe.py            # PyInstaller 打包脚本（v3.1 已改写，见第五节）
+├── PDF盖章工具.spec         # PyInstaller spec（与 build_exe.py 对齐）
+├── requirements.txt        # PyMuPDF>=1.23.0、Pillow>=9.0.0、pyinstaller>=5.0.0
+├── 使用说明.md              # 面向使用者（财务会计）的操作手册
+├── 项目说明.md              # 本文件
+├── test_output\            # 历史手工产物（test.pdf / stamp.png / 3 个导出 PDF）
+├── build\                  # PyInstaller 中间产物
+├── dist\                   # 打包输出目录
+└── backup\                 # 修改前的原文件备份（含 v3.0 快照，本文行号依据）
+```
+
+**已从本文删除的不存在条目**（旧版项目说明写着，磁盘上找不到）：
+
+| 旧文档条目 | 实际情况 |
+|------------|----------|
+| `test_pdf_stamper.py`（unittest 6 用例） | 不存在。历史测试文件是 `test_core.py`，且不是 unittest 风格 |
+| `README.md` | 不存在。项目介绍分散在 `使用说明.md` 和本文件 |
+| 结构图根路径 `/app/working/workspaces/default/` | 错误，实际是 `E:\AI`（Windows + Git Bash，**不是 git 仓库**） |
+
+---
+
+## 二、架构说明
+
+### 1. v3.0 快照的结构（三个类，单文件 750 行）
+
+| 类 | 行号（快照） | 职责 |
+|----|--------------|------|
+| `StampConfig` | 19-72 | 一个公章的全部状态 + 图片加工 + 序列化 |
+| `HistoryManager` | 74-108 | 撤销/重做的两个栈与容量，不碰 GUI、不碰 PDF |
+| `PDFStamper` | 110-741 | 建界面、收鼠标事件、渲染预览、调 PyMuPDF 导入导出 |
+
+**`StampConfig`** —— 字段：`img`（PIL RGBA 原件，不修改）、`name`（取文件名）、`x`/`y`（默认 `100`/`100`，
+**单位是画布像素**）、`scale`（0.1–3.0）、`opacity`（0–1）、`rotation`（0–359 度）。
+方法：`get_scaled_img()`、`get_tk_img()`（预览图）、`apply_opacity()`（`@staticmethod`）、
+`to_dict()` / `from_dict()`（与历史互转，**只存参数不存图片**）。
+
+⚠️ 快照里 `get_tk_img()`（第 36-42 行）先算出带透明度、带旋转的图，第 41 行却用
+`self.get_scaled_img()` 从**原始 `self.img`** 重新缩放，前面的结果被丢掉 —— 这就是 A 项（预览看不到透明度与旋转）。
+
+**`HistoryManager`** —— `undo_stack` / `redo_stack`，`max_history = 50`；`save_state` 压栈并清空 redo 栈；
+`can_undo()` **要求栈里至少 2 条**（第 105 行），第一条是回不去的初始态。
+快照存的 state 形状是 `{'stamps': [to_dict()...], 'current_page': n}`（第 561-567 行），
+恢复时按 `name` 回捞图片（`restore_state`，第 586-601 行）—— 这是 B 项（同名/删过章就认错章）的根源。
+
+**`PDFStamper`** —— 方法分组（按名字定位，比行号耐用）：
+
+| 分组 | 方法 |
+|------|------|
+| 建界面 | `setup_ui` / `create_toolbar` / `create_side_panel` / `create_canvas` / `create_status_bar` / `bind_shortcuts` |
+| PDF | `open_pdf` |
+| 公章 | `load_stamp` / `delete_stamp` / `delete_selected_stamp` / `on_stamp_select` / `update_stamp_list` |
+| 渲染 | `render_page` / `draw_cross_fold_stamp` |
+| 鼠标 | `on_mouse_down` / `on_mouse_drag` / `on_mouse_up` / `on_mouse_wheel` |
+| 翻页 | `prev_page` / `next_page` / `goto_page` |
+| 历史 | `save_history` / `undo` / `redo` / `restore_state` / `update_undo_redo_buttons` |
+| 参数 | `on_scale_change` / `on_opacity_change` / `on_rotation_change` / `on_offset_change` |
+| 模式 | `toggle_cross_fold` / `toggle_layer` / `reset_all` / `select_all_stamps` |
+| 导出 | `export_pdf`（快照第 681-741 行，A–H 里一半问题集中在这里） |
+
+`main()` 只做 `tk.Tk()` → `PDFStamper(root)` → `mainloop()`。没有命令行参数、没有配置文件、没有日志文件。
+
+### 2. v3.1 工作副本把结构拆成两层（未验收）
+
+工作副本的文件头自己写了拆分意图，核心目的是**让逻辑能脱离 Tk 被 import 和测试**：
+
+- **纯逻辑层**（模块级函数 / 无 Tk 依赖的类）：
+  `process_stamp_image()`（唯一的图像管线 opacity → rotate(expand) → scale，带缓存）、
+  `pdf_rect_from_canvas()` / `canvas_rect_from_pdf()` / `stamp_export_geometry()`（坐标换算与导出几何）、
+  `slice_bounds()` / `split_cross_fold_images()` / `cross_fold_slice_rect()` / `cross_fold_geometry()`（骑缝章切片与放置）、
+  `make_history_state()` / `restore_stamps()` / `build_image_pool()`（按唯一 `stamp_id` 快照与恢复）、
+  `open_pdf_document()`（含加密 PDF 认证，返回 `(doc, status)`）、
+  `export_pdf_with_stamps()`（每个章只编码一次并复用 xref）、
+  `RenderCore`（页面位图缓存 + 公章位图缓存）、
+  `shortcut_blocked()` / `is_editable_widget()`（快捷键焦点判断）、
+  `DocumentSession`（非界面状态：文档、公章列表、页码、历史）。
+- **GUI 层**：`PDFStamper` 只剩 Tkinter 交互，计算全部委托出去；旧属性（`pdf_doc`、`stamps`、`current_page`…）
+  通过 `@property` 代理到 `DocumentSession`，以保持既有写法可运行。
+
+这些只是「工作副本里已有这样的代码」的客观转述，**A–H 是否真的都修好了，要看 `tests\` 跑出来的验收结果**（见文末 TODO）。
+
+### 3. 坐标体系（这个项目最容易踩坑的地方，务必读完再改代码）
+
+同时存在三套单位：
+
+1. **PDF point**：PDF 自身单位，1 point = 1/72 英寸，A4 = `595 x 842` point
+   （`test_core.py` 第 20 行建测试页用的正是这个尺寸），PyMuPDF 的 `page.rect` 就是这个单位。
+2. **画布像素**：Tkinter 画布像素，也就是鼠标事件 `event.x` / `event.y` 的单位。
+3. **图片像素**：公章 PNG 自身的宽高（`stamp.img.width`）。
+
+桥梁只有一个公式（v3.0 快照第 140-141 行 `self.render_dpi = 150` / `self.scale_factor = self.render_dpi / 72`；
+v3.1 工作副本里同一个公式被提成函数 `canvas_scale(render_dpi=DEFAULT_RENDER_DPI)`，`DEFAULT_RENDER_DPI` 仍是 150）：
+
+```
+scale_factor = render_dpi / 72 = 150 / 72 ≈ 2.0833
+
+画布像素 = PDF point × scale_factor
+PDF point = 画布像素 ÷ scale_factor
+```
+
+必须记住的四条：
+
+- **`StampConfig.x` / `y` 存的是画布像素，不是 PDF point。** 快照 `on_mouse_drag`（第 509-510 行）
+  把 `event.x/event.y` 直接写进 `stamp.x/stamp.y`。默认 `100, 100` 是「距左上角 100 像素」，
+  换算成 point 约 `48, 48`。
+- **预览侧用像素，导出侧必须除以 `scale_factor` 换成 point。** 快照第 710-711 行换算了位置，
+  但第 713-717 行的 `stamp_rect` 宽高用 `stamp.img.width * stamp.scale`（图片像素，**没除 `scale_factor`**）
+  → 按 v3.0 代码，**导出的公章会比预览明显放大约 2.08 倍**。这正是 G 项要处理的区域。
+- **正确做法是把「处理后的图像尺寸」一起纳入换算**：即宽高原样经过 opacity → rotate(expand) → scale
+  之后得到 `(w, h)`，再用 `(x/sf, y/sf, (x+w)/sf, (y+h)/sf)` 生成 PDF 矩形
+  （v3.1 工作副本的 `stamp_export_geometry()` + `pdf_rect_from_canvas()` 就是这个思路，并声明预览与导出共用同一函数；未验收）。
+  旋转必须用 `expand=True`，否则旋转后图像被裁掉、中心也会偏。
+- **改 `render_dpi` 是全局联动**：预览尺寸、`x/y` 的含义、导出的除法、骑缝偏移量会一起变。
+  只改渲染侧 DPI 而不改导出，位置一定错。想提高清晰度，请连同换算一起检查。
+
+口诀：**画布上是像素，PDF 里是 point，`scale_factor = render_dpi / 72 ≈ 2.0833` 是唯一桥梁，跨边界就除一次；
+宽度和高度与位置同等重要，别只换算 `x/y`。**
+
+---
+
+## 三、功能实际状态
+
+| 功能 | v3.0 快照（已确认） | v3.1 工作副本（未验收） |
+|------|---------------------|--------------------------|
+| 打开 PDF / 翻页 / 跳转页码 | 可用；但重复打开**不关闭旧文档、不清空公章与历史**（C 项） | 已拆出 `open_pdf_document()` / `DocumentSession.close_document()` / `reset_for_new_document()`，并加入密码认证 → C 项修复中 |
+| 拖拽定位 | 可用，坐标为画布像素 | 可用；拖拽期间改为只移动图元（`on_mouse_drag` 不再全量 `render_page`）→ E 项修复中 |
+| 大小 10%–300% | 可用 | 可用 |
+| 透明度 0–100% | 参数存下来了，**预览不生效**（A 项） | 走统一管线，理论上预览生效 → A 项修复中 |
+| 旋转 0–359° | **预览不生效**；导出会转图但矩形尺寸不除 `scale_factor`，几何错（A/G 项） | `process_stamp_image()` + `stamp_export_geometry()` 统一处理 → A/G 项修复中 |
+| 多公章（列表/切换/删除/重置） | 可用 | 可用 |
+| 撤销 / 重做 | **只有 3 处入历史**：拖拽松手（快照第 516 行）、`delete_selected_stamp`（第 382 行）、`reset_all`（第 671 行）。滑块改大小/透明度/旋转**不入历史**；恢复按 `name` 找图（B 项） | 改为按 `stamp_id` 恢复；滑块回调仍**没有**调用 `save_history()`，即「参数改动不可撤销」在工作副本里依然存在 → 待验收，不要写成已修好 |
+| 公章底层 / 上层 | 可用，只在导出时 `send_to_back`（第 732-733 行），预览无差别 | 同上，交由 `export_pdf_with_stamps(underlay=...)` |
+| 骑缝章 | 预览画**两份完整章图**；导出对**每一页插入完整章图**，**没有半章/多页切片**；且导出把垂直位置硬算成页面居中（第 708 行），**忽略拖动的 `y`** → H 项 | 已出现 `split_cross_fold_images()`（N 页每页 1/N 一刀）与 `cross_fold_slice_rect()`，放置仍是垂直居中 → H 项修复中 |
+| 所有公章 → 所有页面 | ✅ 可用（当前唯一的「批量」语义） | 同 |
+| **按页设置不同位置（批量盖章）** | ❌ **未实现**。`page_configs`（快照第 127 行）声明后除第 332 行重置为 `{}`，**从未被写入或读取** | ❌ **仍未实现**。工作副本 `page_configs` 只剩 `DocumentSession` 上的空 dict 与代理属性，`page_index` 仅服务于骑缝章「该显示第几刀」，不是按页位置 |
+| 快捷键 | 绑在 `root`（第 310-317 行），输入框内按 Delete/Ctrl+Z/方向键会误伤 → D 项 | 已有 `shortcut_blocked()` / `is_editable_widget()` 做焦点判断，并新增 `<BackSpace>` → D 项修复中 |
+| `Ctrl + A`「全选公章」 | 只是把 `selected_stamp` 置 `None`，无可见效果 | 仍走 `select_all_stamps()`，未见实质变化 |
+| 加密 PDF | ❌ 无任何处理 | 工作副本有密码分支 → 修复中 |
+| 支持的图片格式 | 文件对话框筛 `png jpg jpeg bmp gif`（`Image.open` 实际能力更广） | 常量 `STAMP_EXT` 扩到含 `tif/tiff/webp`，但对话框筛选项仍是旧的 5 种 → 以验收为准 |
+| 保存 / 加载配置 | ❌ 无 | ❌ 无 |
+| 命令行接口 / 多文件批处理 | ❌ 无 | ❌ 无 |
+
+---
+
+## 四、测试覆盖（实际情况）
+
+### 1. `test_core.py`（306 行）—— 唯一的「盖章功能」测试，但它不是单元测试
+
+- **不 import unittest、没有 assert。** 每步 `try/except`：不抛异常就打 `[OK]` 并记 `True`。
+  所以「N/N 通过」**只表示没崩，不表示结果正确**。
+- 步骤：`[测试1] PDF打开` / `[测试2] 公章加载` / `[测试3] 公章操作(缩放·透明度·旋转)` /
+  `[测试4] PDF盖章导出` / `[验证] 检查输出PDF` / `[测试5] 骑缝章` / `[测试6] 透明度盖章`，汇总 7 项。
+- 它**不 import `pdf_stamper`**，而是自己重写了一遍 PIL/fitz 调用 —— 也就是说它测的不是产品代码。
+- 输出写到 `tempfile.mkdtemp(prefix="pdf_stamp_test_")`（系统临时目录），**不写 `test_output\`**。
+  现有 `E:\AI\test_output\`（`test.pdf`、`stamp.png`、3 个 PDF）是早先手工留下的旧产物。
+
+本次在本机实跑（Python 3.14.2 / PyMuPDF 1.28.2 / win32，只读运行，未改文件）：
+
+| 命令 | 结果 |
+|------|------|
+| `python -X utf8 test_core.py` | 汇总 `7/7 通过`，**退出码 0** |
+| `python test_core.py`（Windows 中文控制台） | 也打印 `总计: 7/7 通过`，但最后输出 `✅` 那行抛 `UnicodeEncodeError: 'gbk' codec can't encode character '\u2705'`，**退出码 1** |
+
+另有一处假阳性值得记下来：`[验证]` 里的「文字内容保留」实际打印 `False`（推测是测试 PDF 用 `helv`
+字体写中文没写进去，未进一步排查），但因脚本无断言，该项仍被计入「通过」。
+
+### 2. `tests\test_packaging.py`（v3.1 新增，未验收）
+
+- 是 `unittest` 风格（`TestIconAssets` / `TestBuildExeArgs` / `TestSpecConsistency` 三个 TestCase 类）。
+- 但**测的是打包链路，不是盖章功能**：图标资源存在性与 ICO 合法性、`build_exe.py` 传给 PyInstaller 的参数、
+  spec 与 `build_exe.py` 是否一致。
+- 本机装有 pytest 9.0.2，`python -m unittest` / `pytest` 都能跑；**本次按分工未运行它**（避免与另一名开发的改动互相干扰）。
+
+### 3. 仍然存在的覆盖缺口（这是文档要如实说的部分）
+
+- 无一条断言覆盖：**坐标换算（`x/y` 像素 → point、宽高换算）**、骑缝章切片、`DocumentSession` 状态机、
+  快捷键焦点判断、Tkinter 界面本身。
+- 第二节列出的坐标公式是全项目最易错的地方，而它目前**零断言**。补测试请优先补这里
+  （纯函数已具备，可以不用起窗口直接断言 `pdf_rect_from_canvas` / `stamp_export_geometry` 的返回值）。
+
+### 4. 已删除的旧内容
+
+旧文档里的 `test_apply_opacity / test_create_stamp_config / test_to_dict_and_from_dict / test_save_and_undo /
+test_redo / test_max_history` 与「Ran 6 tests / OK」输出块，来自**不存在的** `test_pdf_stamper.py`，已整段移除。
+「测试框架: unittest」对 `test_core.py` 而言不成立（现在仅 `tests\test_packaging.py` 用了 unittest）。
+
+---
+
+## 五、技术栈与运行方式
+
+- **GUI**：Tkinter（标准库）
+- **PDF**：PyMuPDF（`import fitz`），本机实测 1.28.2（该版本会打 `fitz` API deprecation 警告，属正常）
+- **图像**：Pillow
+- **打包**：PyInstaller（`--onefile --windowed`）
+- **测试**：一个无断言的 `print` 冒烟脚本 + v3.1 新增的 `tests\test_packaging.py`（unittest，只管打包）
+
+```bash
+# 开发 / 使用
+pip install -r requirements.txt
+python pdf_stamper.py
+
+# 跑测试（Windows 中文控制台请带 -X utf8，原因见第四节）
+python -X utf8 test_core.py
+python -m unittest discover -s tests   # 打包一致性用例（v3.1 新增）
+
+# 打包 EXE → dist\PDF盖章工具.exe
+python build_exe.py
+```
+
+打包脚本的事实说明（v3.1 工作副本已改写，v3.0 快照行为不同，别混着引用）：
+
+- v3.0 快照：开头 `shutil.rmtree` **整目录删掉** `build\`、`dist\`、`__pycache__`，并带 `--optimize=2`。
+- v3.1 工作副本：改为 `cleanup()` **只删自己生成的产物**（`build\PDF盖章工具`、`dist\PDF盖章工具.exe`），
+  不再整目录清空；**去掉了 `--optimize`**（脚本注释说明 PyInstaller 官方不建议，会剥掉 `assert`）；
+  Windows 下追加 `--icon=assets\stamp.ico`。→ 未验收。
+- 本次文档校准**没有**运行打包、没有启动 GUI（按分工约定）。
+
+代码质量方面，旧文档写的「符合 PEP8 / 修复了所有语法错误 / 单元测试全部通过」不做背书：
+v3.0 快照里至少有 5 处未使用的导入（`colorchooser`、`datetime`、`json`、`sys`、`ImageDraw`）。
+本次只以 `ast.parse` 做过只读语法解析（`pdf_stamper.py`、`test_core.py`、`build_exe.py` 均通过），没有 lint 报告。
+
+---
+
+## 六、性能
+
+旧文档的「启动 < 2 秒、1-2 秒/页、5-10 秒/10 页、内存 100-200MB」**没有任何测量记录**，已移除，不要对外引用。
+
+只写能从代码确定的结构性事实（不是计时结论）：
+
+- 预览渲染 DPI = 150。
+- v3.0 快照：`render_page` 每次重新 `get_pixmap` 整页、并为每个公章新建 `ImageTk.PhotoImage`，**零缓存**；
+  鼠标每动一次就全量重渲（E 项）；`export_pdf` 在「页 × 章」最内层循环里重复做 opacity + rotate + PNG 编码（F 项）。
+- v3.1 工作副本：引入 `RenderCore` 页面位图 LRU（`max_page_cache=8`）、模块级公章图像缓存
+  （`STAMP_IMAGE_CACHE_MAX=96`）、`_tk_img_cache` 复用 PhotoImage、导出侧「每个章只编码一次」——
+  对应 E/F 项，**修复中，未验收，也未做耗时对比测量**。
+- 撤销历史上限 50 条。
+
+需要数字时，先做一次基准测试（页数 × 公章数），再把结果填回本节。
+
+---
+
+## 七、已知问题（v3.0 快照已确认的真实行为）
+
+1. **「批量盖章」名不副实**：`page_configs` 从未被使用；实际行为是「所有公章按同一组参数盖到所有页面」，
+   不能按页设不同位置。文档与界面提示都不得宣传按页批量。
+2. 预览不显示透明度与旋转（`get_tk_img` 丢结果）→ A 项，v3.1 修复中。
+3. 撤销覆盖面窄（只有拖拽松手 / 删除选中 / 重置所有）+ 恢复按 `name` 找图会丢公章 → B 项，v3.1 修复中。
+4. 重复打开 PDF 不关闭旧文档、不清空公章与历史 → C 项，v3.1 修复中。
+5. 快捷键绑在 `root`，「跳转到」输入框里按 Delete/Ctrl+Z/方向键会作用到公章或翻页 → D 项，v3.1 修复中。
+6. **骑缝章不是真正的骑缝章**：预览画两份完整章图（一份标 `preview`），导出对**每一页插入完整章图**，
+   无半章/多页切片；导出还把垂直位置硬算成页面正中，**忽略用户拖的上下位置**。
+   偏移语义也与旧使用说明相反：快照里 **0% → 章的一半超出页面右边缘；50% → 章刚好完整贴右边缘内侧；越大越往页内侧（向左）收**。
+   → H 项，v3.1 修复中。
+7. 导出公章尺寸与预览不一致：宽高未除 `scale_factor`（快照第 713-717 行），导出章明显偏大 → 与 G 项同区域，v3.1 修复中。
+8. `Ctrl + A`「全选公章」不产生可见效果。
+9. `python test_core.py` 在 Windows 中文控制台会以 `UnicodeEncodeError` 结束（退出码 1），需 `-X utf8`。
+10. 平台与格式：Linux 需 `python3-tk`；加密 PDF 在 v3.0 无法处理；macOS/Linux 未经验证。
+
+---
+
+## 八、v3.1 修复对照表
+
+| 编号 | 问题 | v3.0 快照位置 | v3.1 工作副本里可见的对应实现 | 状态 |
+|------|------|----------------|-------------------------------|------|
+| A | 预览丢失旋转 / 透明度 | `StampConfig.get_tk_img` 36-42 | `process_stamp_image()` 统一管线，`get_processed_img()` | v3.1 修复中 |
+| B | 历史恢复按名字丢公章 | `restore_state` 586-601 | `stamp_id` + `make_history_state()` / `restore_stamps()` / `build_image_pool()` | v3.1 修复中 |
+| C | `open_pdf` 未关旧文档、不清状态 | 321-337 | `open_pdf_document()`、`DocumentSession.close_document()` / `reset_for_new_document()`、`destroy()` | v3.1 修复中 |
+| D | 快捷键误伤输入框 | `bind_shortcuts` 310-317 | `shortcut_blocked()` / `is_editable_widget()` / `focus_blocks_shortcut()` | v3.1 修复中 |
+| E | 拖拽全量重渲卡顿 | `render_page` / `on_mouse_drag` | `RenderCore` 位图缓存 + 拖拽只 move 图元 | v3.1 修复中 |
+| F | 导出重复 PNG 编码 | `export_pdf` 720-726 | `export_pdf_with_stamps()`（注释称每章只编码一次并复用 xref） | v3.1 修复中 |
+| G | 旋转后导出几何错误 | `export_pdf` 713-717 | `stamp_export_geometry()` + `pdf_rect_from_canvas()`（宽高用处理后尺寸） | v3.1 修复中 |
+| H | 骑缝章未做半章切片 | `draw_cross_fold_stamp` 446-470 / `export_pdf` 698-733 | `split_cross_fold_images()` / `cross_fold_slice_rect()` / `cross_fold_geometry()` | v3.1 修复中 |
+
+「状态」一列在验收测试补齐并跑通之前，一律保持「v3.1 修复中」。
+
+---
+
+## 九、未来优化方向（仍然成立的部分）
+
+1. **让「批量」名副其实**：把 `page_configs` 真正接上或删掉，支持按页 / 页范围设位置。
+2. **给坐标换算补断言**：`pdf_rect_from_canvas` / `stamp_export_geometry` / 骑缝切片都是纯函数，最适合先写用例。
+3. **配置持久化**：`to_dict` / `from_dict` 已具备，缺文件读写与界面入口（JSON 即可）。
+4. **命令行接口**：纯逻辑层已在成形，再往前一步就能批量处理多个 PDF，并让测试直接测产品代码（现在 `test_core.py` 测的是副本逻辑）。
+5. **体验**：网格/对齐辅助线、方向键微调位置、导出进度条、DPI 可调界面项、把「偏移」滑块的真实语义显示出来。
+6. **兼容性**：超大 PDF 分页处理、图片格式对话框与 `STAMP_EXT` 对齐。
+
+---
+
+## 十、TODO：验收后要改口的条目
+
+另一名开发把 A–H 修完、`tests\` 用例跑通后，按此清单逐条更新（**在此之前不要提前写「已完成」**）：
+
+- [ ] **A / B / C / D**：第七节 2-5 条改为「已修复（v3.1）」；第三节表格里透明度、旋转、撤销/重做、打开 PDF 四行
+      的「v3.1 工作副本」列改为「已验收」，并把「滑块改参数不可撤销」这一条按最终代码写清（工作副本目前仍未 `save_history`）。
+- [ ] **H**：第八节状态改为「已完成」，并确认两件事 ——
+      (1) 导出是否真的按页切片（每页 1/N）；(2) 骑缝章垂直位置是否仍固定居中（若仍居中，使用说明必须保留「上下拖动无效」的提醒）。
+      同时重写 `使用说明.md` 骑缝章小节的偏移语义（v3.1 的 `offset=0 贴右缘 / offset=1 完全收进左边距` 与 v3.0 不同）。
+- [ ] **G + 第七节 7 条 + 第二节「坐标体系」第三条**：确认导出宽高与位置使用同一套 `scale_factor` 换算后，
+      把「导出章偏大约 2.08 倍」改为历史说明，或删除。
+- [ ] **E / F + 第六节**：修完做一次真实测速（页数 × 公章数），把数字写进性能节；在那之前保持「未实测」。
+- [ ] **测试覆盖（第四节）**：`test_core.py` 若改成带断言、或 `tests\` 补了坐标/骑缝/历史用例，
+      重写本节：列真实用例名与断言内容，删除「无断言」「测的是副本逻辑」两条警告；
+      若已修 emoji 输出问题，第五节命令里的 `-X utf8` 可退回 `python test_core.py`，第九项 TODO 相应删除。
+- [ ] **`page_configs` / 批量盖章**：真正落地就把第三节该行改成 ✅ 并写清用法；
+      被删除就整条移除，并同步 `使用说明.md` 的批量小节。
+- [ ] **版本号**：v3.1 验收后，把本文顶部、`pdf_stamper.py` 文件头/标题一致性、`使用说明.md` 标题与文末版本字段一起定稿；
+      第八节状态列全部改为「已完成」。
+- [ ] **界面文字**：v3.1 工作副本已把按钮上的 emoji 去掉（`📂 打开PDF` → `打开PDF`）。定稿后同步
+      `使用说明.md` 第三节所有控件名，并把「认文字不认图标」的过渡说明删掉。
+- [ ] **打包脚本**：v3.1 的 `build_exe.py`（只删自有产物、去掉 `--optimize`、加 `--icon`）验收后，
+      第五节的 v3.0/v3.1 两行对比可以合并成一句现状描述。
+- [ ] **行号**：本文引用的快照行号可长期保留（`backup\pdf_stamper.v3.0.orig.py` 不动）；
+      但凡引用「当前 `pdf_stamper.py`」的行号，验收时一律重新 grep 校验。
+
+---
+
+**版本**：本文对应 v3.0 快照的已确认结论 + v3.1 工作副本（修复中，由另一名开发同步）
+**核对方式**：通读 v3.0 快照与 v3.1 工作副本、`test_core.py`、`tests\test_packaging.py`、`build_exe.py`、`requirements.txt`、`PDF盖章工具.spec` + 目录清单 + `ast.parse` 只读语法解析 + 只读运行 `test_core.py`
+**未做的事**：未运行打包、未启动 GUI、未修改任何代码文件
+**测试状态**：`test_core.py` 实跑 7/7（无断言，仅表示未抛异常）；`tests\test_packaging.py` 存在但未由本次运行；GUI 与坐标换算无断言用例

@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+打包PDF盖章工具为EXE文件 - 财务专用版
+支持 Windows/Linux/Mac
+"""
+
+import os
+import sys
+import subprocess
+import shutil
+
+def main():
+    print("="*60)
+    print("PDF盖章工具 - EXE打包脚本")
+    print("="*60)
+    
+    # 清理旧文件
+    for folder in ['build', 'dist', '__pycache__']:
+        if os.path.exists(folder):
+            print(f"清理旧文件: {folder}")
+            shutil.rmtree(folder)
+    
+    # 确保PyInstaller已安装
+    try:
+        import PyInstaller
+        print(f"PyInstaller版本: {PyInstaller.__version__}")
+    except ImportError:
+        print("正在安装PyInstaller...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "pyinstaller"])
+    
+    # 确定平台和输出文件名
+    if sys.platform == "win32":
+        output_name = "PDF盖章工具.exe"
+        sep = ";"
+    elif sys.platform == "darwin":
+        output_name = "PDF盖章工具.app"
+        sep = ":"
+    else:
+        output_name = "PDF盖章工具"
+        sep = ":"
+    
+    print(f"当前平台: {sys.platform}")
+    print(f"输出文件: {output_name}")
+    
+    # PyInstaller参数
+    cmd = [
+        sys.executable, "-m", "PyInstaller",
+        "--name=PDF盖章工具",
+        "--windowed",
+        "--onefile",
+        "--clean",
+        "--noconfirm",
+        "--optimize=2",
+        "--hidden-import=PIL._tkinter_finder",
+        "--hidden-import=PIL.Image",
+        "--hidden-import=PIL.ImageTk",
+        f"--add-data=pdf_stamper.py{sep}.",
+        "pdf_stamper.py"
+    ]
+    
+    print("\n开始打包...")
+    print("命令:", " ".join(cmd))
+    print()
+    
+    try:
+        subprocess.check_call(cmd)
+        
+        # 检查结果
+        exe_path = os.path.abspath(f"dist/{output_name}")
+        if os.path.exists(exe_path):
+            size_mb = os.path.getsize(exe_path) / (1024 * 1024)
+            print("\n" + "="*60)
+            print("✅ 打包成功！")
+            print(f"📦 文件: {exe_path}")
+            print(f"📊 大小: {size_mb:.1f} MB")
+            print("="*60)
+            
+            if sys.platform == "win32":
+                print("\n💡 Windows EXE 使用说明:")
+                print("1. 双击 'PDF盖章工具.exe' 即可运行")
+                print("2. 无需安装Python环境")
+                print("3. 可以发送给其他Windows电脑使用")
+            elif sys.platform == "darwin":
+                print("\n💡 Mac APP 使用说明:")
+                print("1. 双击 'PDF盖章工具.app' 即可运行")
+                print("2. 如提示无法打开，请到系统偏好设置→安全性与隐私→仍要打开")
+            else:
+                print("\n💡 Linux 可执行文件使用说明:")
+                print("1. 运行: ./PDF盖章工具")
+                print("2. 或双击运行（需要执行权限）")
+                print("3. 如需制作Windows EXE，请在Windows环境下运行此脚本")
+            return 0
+        else:
+            print("\n❌ 打包失败：未找到生成的文件")
+            return 1
+            
+    except subprocess.CalledProcessError as e:
+        print(f"\n❌ 打包失败: {e}")
+        return 1
+    except Exception as e:
+        print(f"\n❌ 发生错误: {e}")
+        return 1
+
+if __name__ == "__main__":
+    sys.exit(main())
