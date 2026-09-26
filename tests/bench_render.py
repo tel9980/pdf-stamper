@@ -29,7 +29,10 @@ try:
 except Exception:
     pass
 
-import fitz
+try:  # PyMuPDF >= 1.24 提供 pymupdf 别名；用别名可避免 fitz 的弃用警告
+    import pymupdf as fitz
+except ImportError:  # 旧版本（requirements 下限 1.23）只有 fitz
+    import fitz
 from PIL import Image
 
 import pdf_stamper as ps

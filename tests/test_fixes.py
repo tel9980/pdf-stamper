@@ -27,7 +27,11 @@ try:
 except Exception:
     pass
 
-import fitz
+try:  # PyMuPDF >= 1.24 提供 pymupdf 别名；用别名可避免 fitz 的弃用警告
+    import pymupdf as fitz
+except ImportError:  # 旧版本（requirements 下限 1.23）只有 fitz
+    import fitz
+
 from PIL import Image, ImageDraw
 
 import pdf_stamper as ps
@@ -580,7 +584,6 @@ class TestCOpenPdfState(TempArtifactMixin):
         self.assertEqual(sess.total_pages, 3)
         sess.add_stamp(make_solid_stamp(60), "章A")
         sess.save_history()
-        sess.page_configs[0] = {"whatever": 1}
         sess.selected_stamp = 0
         sess.active_stamp_idx = 0
         sess.cross_fold_mode = True
@@ -590,7 +593,6 @@ class TestCOpenPdfState(TempArtifactMixin):
         sess.load_document(src_pdf_5p())
         self.assertTrue(old_doc.is_closed, "旧文档句柄必须被关闭（无文件句柄泄漏）")
         self.assertEqual(sess.stamps, [], "公章必须清空")
-        self.assertEqual(sess.page_configs, {}, "page_configs 必须清空")
         self.assertEqual(sess.image_pool, {}, "图片池必须清空")
         self.assertIsNone(sess.selected_stamp)
         self.assertEqual(sess.active_stamp_idx, 0)
@@ -897,7 +899,8 @@ class TestPreviewExportConsistency(TempArtifactMixin):
             pix = check[0].get_pixmap(dpi=150, clip=fitz.Rect(*rect))
         # 半透明章叠在白色页面上：中心区域应当既有非红（背景）也有红（章）像素
         img_px = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-        colors = {c[:3] for c in img_px.convert("RGB").getdata()}
+        rgb_bytes = img_px.convert("RGB").tobytes()   # 不用 getdata()：Pillow 14 将移除该 API
+        colors = {rgb_bytes[i:i + 3] for i in range(0, len(rgb_bytes), 3)}
         self.assertGreater(len(colors), 1)
 
 

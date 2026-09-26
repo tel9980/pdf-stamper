@@ -26,7 +26,11 @@ PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 if PROJECT_DIR not in sys.path:
     sys.path.insert(0, PROJECT_DIR)
 
-import fitz
+try:  # PyMuPDF >= 1.24 提供 pymupdf 别名；用别名可避免 fitz 的弃用警告
+    import pymupdf as fitz
+except ImportError:  # 旧版本（requirements 下限 1.23）只有 fitz
+    import fitz
+
 from PIL import Image, ImageDraw
 
 import pdf_stamper as ps
@@ -90,13 +94,11 @@ def step_open_pdf(pdf_path):
     check("页数正确", sess.total_pages == 3, "%d 页" % sess.total_pages)
     stamp = sess.add_stamp(Image.new("RGBA", (60, 60), (0, 0, 255, 255)), "残留章")
     sess.save_history()
-    sess.page_configs[0] = {"x": 1}
     first_doc = sess.pdf_doc
     # 再次打开必须清空旧状态并关闭旧句柄
     status2, _ = sess.load_document(pdf_path)
     check("重新打开成功", status2 == ps.OPEN_OK)
     check("公章状态已清空", sess.stamps == [])
-    check("page_configs 已清空", sess.page_configs == {})
     check("历史已重置", not sess.history.can_undo())
     check("selected/active 已复位", sess.selected_stamp is None and sess.active_stamp_idx == 0)
     check("旧文档句柄已关闭", first_doc.is_closed)

@@ -31,7 +31,10 @@ import uuid
 import tempfile
 from collections import OrderedDict, deque
 
-import fitz  # PyMuPDF（该版本会打印 deprecation 警告，属正常）
+try:  # PyMuPDF >= 1.24 提供 pymupdf 别名；用别名可避免 fitz 的弃用警告
+    import pymupdf as fitz
+except ImportError:  # 旧版本（requirements 下限 1.23）只有 fitz
+    import fitz
 from PIL import Image, ImageDraw, ImageTk
 
 import tkinter as tk
@@ -939,7 +942,6 @@ class DocumentSession:
         self.total_pages = 0
         self.current_page = 0
         self.stamps = []
-        self.page_configs = {}
         self.history = HistoryManager()
         self.image_pool = {}          # {stamp_id: PIL.Image}，只增不删，供 undo 找回
         self.active_stamp_idx = 0
@@ -971,7 +973,6 @@ class DocumentSession:
         self.total_pages = 0
         self.current_page = 0
         self.stamps = []
-        self.page_configs = {}
         self.image_pool = {}
         self.active_stamp_idx = 0
         self.cross_fold_stamp_index = None
@@ -1354,14 +1355,6 @@ class PDFStamper:
     @total_pages.setter
     def total_pages(self, value):
         self.session.total_pages = int(value)
-
-    @property
-    def page_configs(self):
-        return self.session.page_configs
-
-    @page_configs.setter
-    def page_configs(self, value):
-        self.session.page_configs = dict(value)
 
     @property
     def history(self):
