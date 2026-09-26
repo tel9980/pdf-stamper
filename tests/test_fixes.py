@@ -912,8 +912,11 @@ class TestBatchWorkflow(TempArtifactMixin):
             "合同_盖章.pdf")
 
     def test_batch_output_paths_disambiguate_same_names(self):
+        # 用平台原生路径构造同名输入：Windows 上是 one\合同.pdf，POSIX 上是
+        # one/合同.pdf——两侧都必须归并到同一个输出名再加 _2 去重。
         paths = ps.batch_output_paths(
-            [r"C:\\one\合同.pdf", r"D:\\two\合同.pdf"], "out")
+            [os.path.join("one", "合同.pdf"),
+             os.path.join("two", "合同.pdf")], "out")
         self.assertEqual([os.path.basename(path) for path in paths],
                          ["合同_盖章.pdf", "合同_盖章_2.pdf"])
 

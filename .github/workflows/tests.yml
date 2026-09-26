@@ -1,5 +1,6 @@
-# PDF盖章工具 - 持续集成（本地尚未跑过，推到 GitHub 后才生效）
-# 覆盖三条测试线：test_core.py 主套件、unittest discover 全量、GUI smoke（限时开启）。
+# PDF盖章工具 - GitHub Actions 持续集成
+# 覆盖三条测试线：test_core.py 主套件、unittest discover 全量、GUI smoke
+# （Linux 无显示环境用 xvfb-run 提供虚拟显示）。push / pull_request 自动触发。
 name: tests
 
 on:
