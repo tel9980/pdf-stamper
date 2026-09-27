@@ -272,6 +272,30 @@ class TestGExportGeometry(TempArtifactMixin):
             center = Image.frombytes("RGB", (pix.width, pix.height), pix.samples).getpixel((100, 100))
         self.assertLess(max(center), 40)
 
+    def test_underlay_export_falls_back_when_full_page_background_hides_stamp(self):
+        doc = fitz.open()
+        page = doc.new_page(width=200, height=200)
+        page.draw_rect(fitz.Rect(0, 0, 200, 200), color=(1, 1, 1), fill=(1, 1, 1))
+        page.draw_rect(fitz.Rect(96, 96, 104, 104), color=(0, 0, 0), fill=(0, 0, 0))
+        self._open_docs.append(doc)
+        stamp = ps.StampConfig(make_solid_stamp(80, (255, 0, 0, 255)), "底层章")
+        stamp.x, stamp.y = 60, 60
+        out = os.path.join(OUT_DIR, "underlay_full_page_background.pdf")
+
+        core = ps.RenderCore(dpi=72)
+        payload = core.build_payload(doc, 0, [stamp])
+        preview = core.build_underlay_bitmap(doc, payload)
+        report = ps.export_pdf_with_stamps(doc, [stamp], out, scale_factor=1.0, underlay=True)
+        self.assertEqual(report["underlay_fallback_pages"], [0])
+        with fitz.open(out) as check:
+            pix = check[0].get_pixmap(dpi=72, colorspace=fitz.csRGB, alpha=False)
+            exported = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+        self.assertEqual(preview.getpixel((100, 100)), (0, 0, 0))
+        self.assertEqual(exported.getpixel((100, 100)), preview.getpixel((100, 100)))
+        self.assertGreater(exported.getpixel((80, 80))[0], 200)
+        self.assertLess(exported.getpixel((80, 80))[1], 80)
+        self.assertLess(exported.getpixel((80, 80))[2], 80)
+
     def test_underlay_export_preserves_text_and_links(self):
         source_path = os.path.join(OUT_DIR, "underlay_fidelity_source.pdf")
         source_doc = fitz.open()
@@ -346,6 +370,80 @@ class TestGExportGeometry(TempArtifactMixin):
         geo = ps.stamp_export_geometry(stamp, sf)
         self.assertEqual(geo["image_px"], (200, 200))
         self.assertEqual(geo["rect_pt"], (100 / sf, 200 / sf, 300 / sf, 400 / sf))
+
+    def test_underlay_prefilter_skips_pages_without_occluders(self):
+        """预筛：纯文字页应判定为「不可能遮挡」，避免白跑一次渲染比对。"""
+        doc = fitz.open()
+        page = doc.new_page(width=200, height=200)
+        page.insert_text((20, 40), "PLAIN TEXT", fontsize=12, fontname="helv")
+        self._open_docs.append(doc)
+        self.assertFalse(ps._may_hide_underlay(page))
+        # 有填充矩形（可能是整页底色）时必须保守地返回 True
+        page.draw_rect(fitz.Rect(0, 0, 200, 200), color=(1, 1, 1), fill=(1, 1, 1))
+        self.assertTrue(ps._may_hide_underlay(page))
+
+    def test_underlay_prefilter_keeps_image_pages(self):
+        """预筛：页面含图像对象时必须返回 True（可能是整页扫描件）。"""
+        buf = io.BytesIO()
+        Image.new("RGB", (40, 40), (200, 200, 200)).save(buf, format="PNG")
+        doc = fitz.open()
+        page = doc.new_page(width=200, height=200)
+        page.insert_image(fitz.Rect(0, 0, 100, 100), stream=buf.getvalue())
+        self._open_docs.append(doc)
+        self.assertTrue(ps._may_hide_underlay(page))
+
+    def test_underlay_detection_uses_local_render(self):
+        """
+        兜底检测必须只渲染印章矩形区域，而不是整页。
+
+        做法：直接比对「局部裁剪渲染」与「整页渲染」下 _same_rendered_region 的结论
+        是否一致，并用 pixmap 尺寸证明局部渲染确实只覆盖印章范围。
+        """
+        doc = fitz.open()
+        page = doc.new_page(width=595, height=842)
+        page.draw_rect(fitz.Rect(0, 0, 595, 842), color=(1, 1, 1), fill=(1, 1, 1))
+        page.insert_text((60, 100), "HIDDEN", fontsize=12, fontname="helv")
+        self._open_docs.append(doc)
+        stamp = ps.StampConfig(make_solid_stamp(80, (255, 0, 0, 255)), "遮挡章")
+        stamp.x, stamp.y = 200, 300
+        sf = ps.canvas_scale()
+        new_doc = fitz.open()
+        self._open_docs.append(new_doc)
+        new_doc.insert_pdf(doc)
+        payloads, _ = ps._prepare_stamp_payloads([stamp], new_doc, sf, False, None, 0.5)
+        payload = payloads[0]
+        ppp = 150 / 72.0
+        detect = fitz.Rect(*payload["rect_pt"])
+
+        local_base = doc[0].get_pixmap(matrix=fitz.Matrix(ppp, ppp), clip=detect,
+                                       colorspace=fitz.csRGB, alpha=False)
+        local_stamped = new_doc[0].get_pixmap(matrix=fitz.Matrix(ppp, ppp), clip=detect,
+                                              colorspace=fitz.csRGB, alpha=False)
+        # 局部渲染的尺寸应约等于印章矩形，而不是整页
+        self.assertLess(local_base.width, doc[0].rect.width * ppp)
+        self.assertLess(local_base.height, doc[0].rect.height * ppp)
+
+        full_base = doc[0].get_pixmap(dpi=150, colorspace=fitz.csRGB, alpha=False)
+        full_stamped = new_doc[0].get_pixmap(dpi=150, colorspace=fitz.csRGB, alpha=False)
+        self.assertTrue(ps._same_rendered_region(local_base, local_stamped,
+                                                 payload["rect_pt"], ppp))
+        self.assertTrue(ps._same_rendered_region(full_base, full_stamped,
+                                                 payload["rect_pt"], ppp))
+
+    def test_underlay_local_render_report_lists_all_obscured_pages(self):
+        """整页白底文档：所有盖章页都应进入 underlay_fallback_pages。"""
+        doc = fitz.open()
+        for _ in range(3):
+            page = doc.new_page(width=200, height=200)
+            page.draw_rect(fitz.Rect(0, 0, 200, 200), color=(1, 1, 1), fill=(1, 1, 1))
+            page.insert_text((20, 40), "TEXT", fontsize=12, fontname="helv")
+        self._open_docs.append(doc)
+        stamp = ps.StampConfig(make_solid_stamp(80, (255, 0, 0, 255)), "章")
+        stamp.x, stamp.y = 60, 60
+        out = os.path.join(OUT_DIR, "underlay_local_render.pdf")
+        report = ps.export_pdf_with_stamps(doc, [stamp], out,
+                                           scale_factor=1.0, underlay=True)
+        self.assertEqual(report["underlay_fallback_pages"], [0, 1, 2])
 
 
 # ==================== F. 导出重复编码 ====================
@@ -488,6 +586,97 @@ class TestHCrossFold(TempArtifactMixin):
         for emb in report["embedded"]:
             self.assertEqual(emb["rect"], geo["rect_pt"])
             self.assertEqual(emb["kind"], "stamp")
+
+    def test_vertical_position_is_draggable_and_honoured(self):
+        """骑缝章可垂直拖动：y_pt 显式传入时按传入值定位（不再强制居中）。"""
+        img = make_solid_stamp(180)
+        w_pt = 60.0  # 每刀名义宽度
+        h_pt = 180.0
+        # 不传 y_pt 仍是历史行为：垂直居中
+        centred = ps.cross_fold_slice_rect(595, 842, w_pt, h_pt, 0, 3, 0.5)
+        self.assertAlmostEqual(centred[1], (842 - h_pt) / 2.0, places=6)
+        # 显式传入 y_pt 时以传入值为顶边
+        raised = ps.cross_fold_slice_rect(595, 842, w_pt, h_pt, 0, 3, 0.5, y_pt=100.0)
+        self.assertAlmostEqual(raised[1], 100.0, places=6)
+        lowered = ps.cross_fold_slice_rect(595, 842, w_pt, h_pt, 0, 3, 0.5, y_pt=600.0)
+        self.assertAlmostEqual(lowered[1], 600.0, places=6)
+        # 水平分量与垂直分量互不影响
+        self.assertAlmostEqual(raised[0], centred[0], places=6)
+        self.assertAlmostEqual(raised[2], centred[2], places=6)
+        # y_pt 被夹在合理范围内（不允许整枚章跑出页面）
+        way_out = ps.cross_fold_slice_rect(595, 842, w_pt, h_pt, 0, 3, 0.5, y_pt=99999.0)
+        self.assertLessEqual(way_out[3], 842 + h_pt * 0.5 + 1e-6)
+        way_up = ps.cross_fold_slice_rect(595, 842, w_pt, h_pt, 0, 3, 0.5, y_pt=-99999.0)
+        self.assertGreaterEqual(way_up[1], -h_pt * 0.5 - 1e-6)
+
+    def test_cross_fold_top_pt_from_stamp_position(self):
+        """画布像素坐标 -> PDF 点：cross_fold_top_pt 就是 y_px / scale_factor。"""
+        sf = ps.canvas_scale()
+        stamp = ps.StampConfig(make_solid_stamp(90), "骑缝")
+        stamp.set_position_for_page(0, 300, 450)
+        self.assertAlmostEqual(ps.cross_fold_top_pt(stamp, 0, sf), 450.0 / sf, places=9)
+        # 换页取各自的画布 y
+        stamp.set_position_for_page(2, 300, 120)
+        self.assertAlmostEqual(ps.cross_fold_top_pt(stamp, 2, sf), 120.0 / sf, places=9)
+
+    def test_geometry_follows_stamp_vertical_position(self):
+        """预览与导出共用 cross_fold_geometry：它必须把 stamp 的 y 传下去。"""
+        sf = ps.canvas_scale()
+        stamp = ps.StampConfig(make_solid_stamp(180), "骑缝")
+        stamp.scale = 1.0
+        page_rect = fitz.Rect(0, 0, 595, 842)
+        stamp.set_position_for_page(0, 0, 100)
+        low = ps.cross_fold_geometry(stamp, page_rect, 3, 0.5, sf, page_index=0)
+        stamp.set_position_for_page(0, 0, 700)
+        high = ps.cross_fold_geometry(stamp, page_rect, 3, 0.5, sf, page_index=0)
+        self.assertGreater(high["rect_pt"][1], low["rect_pt"][1])
+        self.assertAlmostEqual(high["rect_pt"][1] - low["rect_pt"][1], 600.0 / sf, places=6)
+        # 三刀共享同一垂直位置（拼合后仍是一枚完整的章）
+        tops = {round(ps.cross_fold_geometry(stamp, page_rect, 3, 0.5, sf,
+                                            page_index=i)["rect_pt"][3] - 0, 6)
+                for i in range(3)}
+        heights = {round(ps.cross_fold_geometry(stamp, page_rect, 3, 0.5, sf,
+                                               page_index=i)["rect_pt"][3]
+                         - ps.cross_fold_geometry(stamp, page_rect, 3, 0.5, sf,
+                                                 page_index=i)["rect_pt"][1], 6)
+                   for i in range(3)}
+        self.assertEqual(len(tops), 1)
+        self.assertEqual(len(heights), 1)
+
+    def test_cross_fold_drag_keeps_x_and_updates_y(self):
+        """拖动回调：骑缝章只改垂直坐标，x 保持原值。"""
+        drag_src = inspect.getsource(ps.PDFStamper.on_mouse_drag)
+        self.assertIn("drag_vertical_only", drag_src)
+        self.assertIn("position_for_page", drag_src)
+        self.assertIn("set_position_for_page", drag_src)
+        down_src = inspect.getsource(ps.PDFStamper.on_mouse_down)
+        self.assertIn("cross_fold", down_src)
+        init_src = inspect.getsource(ps.PDFStamper.__init__)
+        self.assertIn("drag_vertical_only", init_src)
+
+    def test_cross_fold_vertical_position_survives_export(self):
+        """导出的切片顶端必须与画布拖动后的位置一致（预览=导出）。"""
+        sf = ps.canvas_scale()
+        img = self.load_stamp_image()
+        stamp = ps.StampConfig(img, "骑缝章")
+        stamp.scale = 1.0
+        h_px = stamp.get_processed_img().size[1]
+        target_y_px = 260
+        for i in range(3):
+            stamp.set_position_for_page(i, 0, target_y_px)
+        out = os.path.join(OUT_DIR, "crossfold_vertical.pdf")
+        report = ps.export_pdf_with_stamps(self.open_src(), [stamp], out, scale_factor=sf,
+                                          cross_fold_mode=True, cross_fold_stamp_index=0,
+                                          cross_fold_offset=0.5)
+        with fitz.open(out) as check:
+            per_page = embedded_rects(check)
+            expected_top = target_y_px / sf
+            for i, rects in enumerate(per_page):
+                _, rect = rects[0]
+                self.assertLessEqual(abs(rect[1] - expected_top), 1.0)
+                geo = ps.cross_fold_geometry(stamp, check[i].rect, 3, 0.5, sf, page_index=i)
+                self.assertLessEqual(abs(geo["rect_pt"][1] - expected_top), 0.5)
+                self.assertLessEqual(abs((rect[3] - rect[1]) - h_px / sf), 1.0)
 
 
 # ==================== B. 历史按 id 恢复 ====================
@@ -769,6 +958,29 @@ class TestERenderCaching(TempArtifactMixin):
         self.assertEqual(core.stats["page_hit"], hits_before)
         self.assertEqual(core.stats["page_miss"], 4)
 
+    def test_page_cache_pixel_budget_eviction(self):
+        """像素预算淘汰：预算收紧时必须真的把旧页踢出去，且账目不掉成负数。"""
+        doc = self.open_src()
+        probe = ps.RenderCore(dpi=150)
+        one_page = probe.get_page_bitmap(doc, 0)
+        page_bytes = one_page.width * one_page.height * 3
+
+        # 预算只够放 1 页 -> 缓存页数应被压到 1
+        core = ps.RenderCore(dpi=150, max_page_cache=99,
+                             max_page_bytes=int(page_bytes * 1.2))
+        for index in range(min(3, doc.page_count)):
+            core.get_page_bitmap(doc, index)
+        info = core.cache_info()
+        self.assertEqual(info["cached_pages"], 1)
+        self.assertGreater(info["cached_page_bytes"], 0)
+        self.assertLessEqual(info["cached_page_bytes"], info["max_page_bytes"])
+
+        # 预算充足时不应被像素口径干扰
+        roomy = ps.RenderCore(dpi=150, max_page_cache=99, max_page_bytes=1024 ** 3)
+        for index in range(min(3, doc.page_count)):
+            roomy.get_page_bitmap(doc, index)
+        self.assertEqual(roomy.cache_info()["cached_pages"], min(3, doc.page_count))
+
     def test_stamp_bitmap_cache_hit(self):
         core = ps.RenderCore(dpi=150)
         stamp = ps.StampConfig(self.load_stamp_image(), "章")
@@ -792,15 +1004,19 @@ class TestERenderCaching(TempArtifactMixin):
         self.assertIsNone(ps.stamp_index_from_tags(None, 3))
         self.assertIsNone(ps.stamp_index_from_tags(("stamp_5", "stamp_item"), 3), "越界索引")
         self.assertIsNone(ps.stamp_index_from_tags(("stamp_x", "stamp_item"), 3))
-        # 普通公章可拖；骑缝章切片不可拖
+        # 普通公章与骑缝章切片都可拖（骑缝章拖动只应用垂直分量，见 on_mouse_drag）
         self.assertTrue(ps.drag_allowed_for_tags(("stamp_0", "stamp_item", "stamp")))
-        self.assertFalse(ps.drag_allowed_for_tags(("stamp_0", "stamp_item", "cross_fold")))
+        self.assertTrue(ps.drag_allowed_for_tags(("stamp_0", "stamp_item", "cross_fold")))
         self.assertFalse(ps.drag_allowed_for_tags(("page",)))
         self.assertFalse(ps.drag_allowed_for_tags(None))
         # on_mouse_down 必须走这两个函数（而不是内联字符串解析）
         down_src = inspect.getsource(ps.PDFStamper.on_mouse_down)
         self.assertIn("stamp_index_from_tags", down_src)
         self.assertIn("drag_allowed_for_tags", down_src)
+        # 骑缝章拖动只能改垂直位置：on_mouse_drag 必须保留原有 x
+        drag_src = inspect.getsource(ps.PDFStamper.on_mouse_drag)
+        self.assertIn("drag_vertical_only", drag_src)
+        self.assertIn("position_for_page", drag_src)
 
     def test_payload_geometry_matches_stamp_coordinates(self):
         core = ps.RenderCore(dpi=150)
@@ -902,6 +1118,73 @@ class TestPreviewExportConsistency(TempArtifactMixin):
         rgb_bytes = img_px.convert("RGB").tobytes()   # 不用 getdata()：Pillow 14 将移除该 API
         colors = {rgb_bytes[i:i + 3] for i in range(0, len(rgb_bytes), 3)}
         self.assertGreater(len(colors), 1)
+
+
+class TestExportOptions(TempArtifactMixin):
+    """导出选项对象：参数收口 + 数值夹紧 + 旧调用点仍可用。"""
+
+    def test_defaults_match_legacy_behaviour(self):
+        opts = ps.ExportOptions()
+        self.assertFalse(opts.cross_fold_mode)
+        self.assertIsNone(opts.cross_fold_stamp_index)
+        self.assertAlmostEqual(opts.cross_fold_offset, 0.5)
+        self.assertTrue(opts.underlay)
+
+    def test_normalised_clamps_offset_and_index(self):
+        high = ps.ExportOptions(True, 5, 3.0, True).normalised()
+        self.assertAlmostEqual(high.cross_fold_offset, 1.0)
+        self.assertEqual(high.cross_fold_stamp_index, 5)
+        low = ps.ExportOptions(True, -2, -1.0, True).normalised()
+        self.assertAlmostEqual(low.cross_fold_offset, 0.0)
+        self.assertEqual(low.cross_fold_stamp_index, 0)
+        # None 语义必须保留（按每个章自己的 is_cross_fold 判断），不能被压成 0
+        self.assertIsNone(ps.ExportOptions(False, None, 0.5, True).normalised()
+                          .cross_fold_stamp_index)
+
+    def test_from_namespace_ignores_unknown_keys(self):
+        opts = ps.ExportOptions.from_namespace(cross_fold_offset=0.25, not_a_field=1)
+        self.assertAlmostEqual(opts.cross_fold_offset, 0.25)
+        self.assertFalse(hasattr(opts, "not_a_field"))
+
+    def test_export_accepts_options_object(self):
+        sf = ps.canvas_scale()
+        stamp = ps.StampConfig(make_solid_stamp(90), "章")
+        stamp.x, stamp.y = 100, 150
+        out = os.path.join(OUT_DIR, "options_object.pdf")
+        report = ps.export_pdf_with_stamps(
+            self.open_src(), [stamp], out, scale_factor=sf,
+            options=ps.ExportOptions(underlay=True))
+        self.assertEqual(report["page_count"], 3)
+        # options 与散装参数给出同一结果
+        legacy = ps.export_pdf_with_stamps(
+            self.open_src(), [stamp], os.path.join(OUT_DIR, "options_legacy.pdf"),
+            scale_factor=sf, underlay=True)
+        self.assertEqual([e["rect"] for e in report["embedded"]],
+                         [e["rect"] for e in legacy["embedded"]])
+
+    def test_build_payload_honours_options(self):
+        core = ps.RenderCore(dpi=150)
+        doc = self.open_src()
+        stamp = ps.StampConfig(self.load_stamp_image(), "骑缝")
+        via_kwargs = core.build_payload(doc, 1, [stamp], cross_fold_mode=True,
+                                        cross_fold_stamp_index=0, cross_fold_offset=0.5)
+        via_options = core.build_payload(doc, 1, [stamp],
+                                         options=ps.ExportOptions(True, 0, 0.5, True))
+        self.assertEqual(via_kwargs["stamp_items"][0]["kind"], "cross_fold")
+        self.assertEqual(via_kwargs["stamp_items"][0]["kind"],
+                         via_options["stamp_items"][0]["kind"])
+        self.assertEqual(via_kwargs["stamp_items"][0]["x"],
+                         via_options["stamp_items"][0]["x"])
+
+    def test_stamp_ext_constant_matches_dialog_filter(self):
+        self.assertIn(".png", ps.STAMP_EXT)
+        self.assertIn(".jpg", ps.STAMP_EXT)
+        patterns = ps.STAMP_FILE_DIALOG_TYPES[0][1]
+        for ext in ps.STAMP_EXT:
+            self.assertIn("*" + ext, patterns)
+        # GUI 里不再硬编码扩展名清单
+        load_src = inspect.getsource(ps.PDFStamper.load_stamp)
+        self.assertIn("STAMP_FILE_DIALOG_TYPES", load_src)
 
 
 class TestBatchWorkflow(TempArtifactMixin):

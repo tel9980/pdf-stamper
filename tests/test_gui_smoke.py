@@ -238,6 +238,59 @@ class TestGuiSmoke(unittest.TestCase):
                          ["cross_fold", "stamp"])
         self.assertEqual(payload["stamp_items"][1]["size"], (80, 80))
 
+    def test_cross_fold_copy_and_page_scope_are_independent(self):
+        app = self.app
+        app.open_pdf(self.pdf_path)
+        source = app.add_stamp_image(self.Image.new("RGBA", (100, 100), (255, 0, 0, 220)), "公章")
+        other = app.add_stamp_image(self.Image.new("RGBA", (80, 80), (0, 0, 255, 220)), "另一枚")
+        app.active_stamp_idx = 0
+        app.seal_mode_var.set("首页加印章")
+        app.on_seal_mode_change()
+        self.assertEqual(source.page_scope, "first")
+        self.assertEqual(other.page_scope, "all")
+
+        source.x, source.y = 150, 180
+        source.scale = 1.2
+        fold_copy = app.add_cross_fold_copy()
+        self.assertIsNot(fold_copy, source)
+        self.assertIsNot(fold_copy.img, source.img)
+        self.assertTrue(fold_copy.is_cross_fold)
+        self.assertEqual(fold_copy.scale, source.scale)
+        self.assertEqual(fold_copy.page_scope, "all")
+
+        app.scale_var.set(1.7)
+        app.on_scale_change("1.7")
+        app.offset_var.set(0.8)
+        app.on_offset_change("0.8")
+        self.assertEqual(source.scale, 1.2)
+        self.assertEqual(source.cross_fold_offset, 0.5)
+        self.assertEqual(fold_copy.scale, 1.7)
+        self.assertEqual(fold_copy.cross_fold_offset, 0.8)
+
+        app.seal_mode_var.set("尾页加印章")
+        app.on_seal_mode_change()
+        self.assertEqual(fold_copy.page_scope, "last")
+        self.assertEqual(source.page_scope, "first")
+        self.assertEqual(other.page_scope, "all")
+        self.assertEqual(app.stamp_export_btn["text"], "盖章并导出PDF")
+        output = os.path.join(self.tmp, "independent_stamps.pdf")
+        report = app.export_pdf(output)
+        self.assertEqual(
+            [(item["page"], item["stamp_id"]) for item in report["embedded"]],
+            [(0, source.stamp_id), (0, other.stamp_id),
+             (1, other.stamp_id), (2, other.stamp_id), (2, fold_copy.stamp_id)])
+        kinds = [item["kind"] for item in app.render_page()["stamp_items"]]
+        self.assertEqual(kinds, ["stamp", "stamp"])
+        app.current_page = 2
+        self.assertEqual([item["kind"] for item in app.render_page()["stamp_items"]],
+                 ["stamp", "cross_fold"])
+        app.seal_mode_var.set("不加印章")
+        app.on_seal_mode_change()
+        self.assertEqual(fold_copy.page_scope, "none")
+        self.assertEqual(source.page_scope, "first")
+        self.assertEqual(other.page_scope, "all")
+        self.assertEqual(len(app.render_page()["stamp_items"]), 1)
+
     def test_rotation_opacity_preview_matches_export(self):
         app = self.app
         app.open_pdf(self.pdf_path)
@@ -256,6 +309,41 @@ class TestGuiSmoke(unittest.TestCase):
                               / app.scale_factor, delta=0.5)
         self.assertEqual(len([d for d in self.dialogs if d[0] == "showerror"]), 0,
                          "导出路径不应报错（旧版 send_to_back 已修复）")
+
+    def test_zoom_drag_stamp_to_page_bottom_and_export(self):
+        app = self.app
+        app.open_pdf(self.pdf_path)
+        stamp = app.add_stamp_image(self.Image.new("RGBA", (80, 60), (255, 0, 0, 220)), "底部章")
+        app.on_view_zoom_change("1.75")
+        payload = app.render_page()
+        page_height_px = payload["page_bitmap"].height
+        target_y = page_height_px - stamp.get_processed_img().height
+
+        app.canvas.yview_moveto(1.0)
+        app.root.update()
+        self.assertGreater(float(app.canvas.yview()[0]), 0.0,
+                           "放大后应能滚动到页面底部")
+
+        scroll_x = app.canvas.canvasx(0)
+        scroll_y = app.canvas.canvasy(0)
+        start = FakeEvent(int(stamp.x * app.view_zoom - scroll_x + 5),
+                          int(stamp.y * app.view_zoom - scroll_y + 5))
+        app.on_mouse_down(start)
+        target = FakeEvent(int(stamp.x * app.view_zoom - scroll_x + 5),
+                           int(target_y * app.view_zoom - scroll_y + 5))
+        app.on_mouse_drag(target)
+        app.on_mouse_up(target)
+        self.assertAlmostEqual(stamp.y, target_y, delta=1.5)
+
+        out = os.path.join(self.tmp, "gui_bottom_zoom.pdf")
+        report = app.export_pdf(out)
+        self.assertIsNotNone(report)
+        exported = report["embedded"][0]["rect"]
+        page_height_pt = app.pdf_doc[0].rect.height
+        self.assertAlmostEqual(exported[3], page_height_pt, delta=1.0)
+        self.assertAlmostEqual(exported[3] - exported[1],
+                               stamp.get_processed_img().height / app.scale_factor,
+                               delta=0.5)
 
     def test_open_second_pdf_resets_gui_state(self):
         app = self.app
