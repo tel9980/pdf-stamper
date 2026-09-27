@@ -76,6 +76,26 @@ def cleanup():
     remove_own_artifact(os.path.join("dist", output_name_for_platform()))
 
 
+def run_with_project_venv():
+    """从系统 Python 启动时，优先在项目虚拟环境中重新运行本脚本。"""
+    if sys.prefix != sys.base_prefix:
+        return None
+
+    project_root = os.path.dirname(os.path.abspath(__file__))
+    if os.name == "nt":
+        python = os.path.join(project_root, ".venv", "Scripts", "python.exe")
+    else:
+        python = os.path.join(project_root, ".venv", "bin", "python")
+    if not os.path.isfile(python):
+        return None
+    if os.path.normcase(os.path.abspath(python)) == os.path.normcase(os.path.abspath(sys.executable)):
+        return None
+
+    print(f"检测到项目虚拟环境，切换打包解释器: {python}")
+    return subprocess.call(
+        [python, os.path.abspath(__file__), *sys.argv[1:]], cwd=project_root)
+
+
 def ensure_pyinstaller():
     try:
         import PyInstaller
@@ -188,4 +208,7 @@ def main():
 
 
 if __name__ == "__main__":
+    venv_exit_code = run_with_project_venv()
+    if venv_exit_code is not None:
+        sys.exit(venv_exit_code)
     sys.exit(main())
