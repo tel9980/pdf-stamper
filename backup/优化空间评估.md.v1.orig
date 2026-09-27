@@ -1,0 +1,293 @@
+# PDF盖章工具 —— 优化空间评估
+
+> **评估基准**：`E:\AI` 工作区当前磁盘状态（`pdf_stamper.py` 2,668 行，工作区有 5 个文件未提交，HEAD = `ae3c928`）
+> **评估方式**：通读 `pdf_stamper.py` 全文 → `ast` 结构解析（函数体量 / 循环嵌套 / 未用导入）→ **实跑微基准**测出每条结论的代价 → 对照两份 md 的已知限制
+> **实测环境**：Windows / Python 3.14.2 / PyMuPDF 1.28.2 / Pillow 12.1.0（项目 `.venv`）
+> **日期**：2026-09-27
+>
+> 本文只写**实测过**的数字，每条都带口径。凡"估计值"一律标注。
+
+---
+
+## 零、先说结论：优先级排布
+
+按「收益 ÷ 改动风险」排序，建议这个顺序动手：
+
+| 优先级 | 项目 | 类型 | 实测收益 | 改动面 |
+|--------|------|------|----------|--------|
+| **P0** | 图像处理管线三级缓存 | 性能（交互卡顿） | 拖动滑块 **80 → ~4 ms/帧** | 单函数 + 1 处 GUI 调用 |
+| **P0** | 导出兜底检测改局部渲染 | 性能（导出耗时） | 30 页省 **~535 ms**（-79%） | 单函数内 2 处 |
+| **P1** | 骑缝章垂直位置可调 | 功能（文档里的已知限制） | 补齐一个有断言位的缺口 | 几何函数 + GUI |
+| **P1** | 导出/打开长任务移出 UI 线程 | 体验（"假死"） | 消除数百页文档的界面冻结 | 中等，需线程安全设计 |
+| **P2** | 渲染路径三项微优化 | 性能（翻页） | 单页 **8.9 → ~6.0 ms**（-33%） | 低风险，逐项可独立验证 |
+| **P2** | 图片格式与 `STAMP_EXT` 对齐 | 一致性 | 消除筛选项与实现能力漂移 | 低 |
+| **P2** | `ExportOptions` 收口 | 可维护性 | 消掉 3 处重复的 `cross_fold_mode=False` 调用 | 低 |
+| **P3** | CLI / 配置内嵌图片 / 基准留档 | 能力扩展 | 无人值守批处理 | 中 |
+
+---
+
+## 一、P0-1：图像处理管线缺分级缓存（**交互卡顿的主因**）
+
+### 问题
+
+`process_stamp_image()`（L295-336）把 `opacity → rotate(BICUBIC) → scale(LANCZOS)` 串成一条链，缓存 key 是整个参数元组：
+
+```python
+key = (id(img), img.size, img.mode, opacity_f, rotation_i, round(scale_f, 4))
+```
+
+**只要有任何一个参数变了，前两级也要从头重算。** 但实际使用中这三者的变化频率差别极大：
+
+- `opacity`——拖滑块时每帧都变
+- `scale`——拖滑块时每帧都变
+- `rotation`——偶尔变一次
+
+于是「拖大小滑块」时，每帧都在重做**同样参数**的 `apply_opacity`，纯属浪费。
+
+### 实测
+
+| 项目 | 实测值 | 口径 |
+|------|--------|------|
+| 拖动大小滑块 60 帧（单个 800px 公章，每帧含处理 + PNG 编码） | **4,810 ms**（**80 ms/帧**） | 本机，`process_stamp_image` + `image_to_png_bytes` 串行 |
+| ├ `apply_opacity` 800×800 | **4.6 ms/次** | 3 次 `split` + `point` + `merge`，每次重做 |
+| ├ `rotate(expand=True, BICUBIC)` 800px | **1.7 ms/次** | 偶尔变，可接受 |
+| └ `resize(LANCZOS)` 800→400 | **18.0 ms/次** | 单步最大头 |
+| 3 个 600px 章 × 20 档缩放（冷缓存） | **578 ms**（**9.6 ms/章/档**） | 每档都是 cache miss |
+
+80 ms/帧意味着**约 12 FPS**，滑块手感明显发涩。而其中 `apply_opacity` 那 4.6 ms **完全没必要重算**。
+
+### 建议
+
+把单级缓存改成**三级流水线缓存**（每级各自 LRU）：
+
+```
+img ──[apply_opacity]──> L1(key: id(img),opacity) ──[rotate]──> L2(+rotation) ──[resize]──> L3(+scale)
+```
+
+拖 `scale` 时 L1/L2 命中，只跑 18 ms 的 resize；拖 `opacity` 时只跑 4.6 ms 的 opacity（后两级因图变了必须重跑，但可把 resize 挪到 L1 之后）。
+
+**更有效的一招**：预览端不要按 `scale` 生成原尺寸图再交给 Tk 显示——**直接生成最终显示尺寸**（`原图 × scale × view_zoom`），一步 resize 到位。现在 `render_page` 先 `get_processed_img()`（含 scale 的 LANCZOS）再 `_display_image(image, zoom)`（又一次 LANCZOS），**同一张图被 Lanczos 缩放了两次**。
+
+预估（口径：以上实测值的合理外推，未实现）：
+- 拖 `scale`：**~80 ms → ~20 ms/帧**（只保留 resize + PhotoImage）
+- 拖 `opacity`：**~80 ms → ~8 ms/帧**（复用缩放结果，只做法元级 alpha 替换）
+- 实测依据：整页 Lanczos(43.6 ms) → Bilinear(17.2 ms) 是 2.5×，说明**改插值算法自身也有 2.5 倍空间**；预览缩放场景对画质不敏感，可考虑 `BILINEAR`，导出仍用 `LANCZOS`（导出口径不能降）。
+
+### 顺带
+
+- `apply_opacity` 对 `opacity >= 1.0` 已短路返回原图（正确），所以**只有真正调过透明度的章**才吃这 4.6 ms——这也是为什么缓存要分级而不是简单加大 L1。
+- `_stamp_image_cache` 只有 `entries/max` 两个字段，`hits` 恒为 `None`（L393-394），**缓存命中率无法观测**。建议补 `hits/misses` 计数器，否则优化后无法验证效果。
+
+---
+
+## 二、P0-2：导出兜底检测每页渲染两次整页位图
+
+### 问题
+
+`export_pdf_with_stamps()` 里新增的底层遮挡兜底（L907-926），对**每一页**都渲染两次**整页**位图：
+
+```python
+base_pixmap    = src_doc[page_index].get_pixmap(dpi=dpi, ...)     # 整页
+stamped_pixmap = new_doc[page_index].get_pixmap(dpi=dpi, ...)     # 整页
+```
+
+但真正要比对、要提取像素的，只有**印章所在的矩形**。`_same_rendered_region()`（L990-1007）内部也只用 `rect_pt` 裁剪后的那小块。
+
+### 实测
+
+| 项目 | 实测值 | 口径 |
+|------|--------|------|
+| 整页渲染 + 转 PIL（A4, dpi=150） | **11.3 ms/次** | `get_pixmap` + `Image.frombytes` |
+| 印章矩形渲染 + 转 PIL（200×200pt 区域） | **2.3 ms/次** | 同上但 `clip=rect` |
+| 30 页 × 2 次（现状） | **~675 ms** | 外推 |
+| 30 页 × 2 次（改局部） | **~140 ms** | 外推，**省 ~535 ms** |
+
+另外，这段代码在 `underlay=True` 时**无条件触发**——即使这一页根本没有「整页白底覆盖」这种病态结构，也要先花两次整页渲染去"证明它没问题"。
+
+### 建议
+
+1. **只渲染印章矩形**：把 `get_pixmap(..., clip=rect)` 用起来，`_same_rendered_region` 的坐标换算同步改为相对裁剪原点。收益 **-79%**（上表）。
+2. **加廉价预筛查**：只在页面**图像对象数 ≥ 2 且存在覆盖整页的大图**时才做检测。多数正常 PDF 直接跳过，`underlay` 导出回到「只插图」的快路径。
+3. `pixels_per_point` 那套「point ↔ 像素」换算在 `export_pdf_with_stamps` 和 `_same_rendered_region` 里各写了一遍，建议抽成一个函数（`pdf_rect_to_pixmap_bounds`），否则以后改 `render_dpi` 很容易只改一处。
+
+> 这一项是**上一批未提交改动刚引入的**，属于"功能对了但代价没算"。趁改动还没进版本库，一并收拾最划算。
+
+---
+
+## 三、P1：骑缝章垂直位置可调（文档明写的头号已知限制）
+
+`项目说明.md` 第七节第 1 条、`使用说明.md` 第五节第 7 条都写着：**"上下位置固定居中，上下拖动无效"**，且 `项目说明.md` 的"未来优化方向"第 1 条把它列为第一项。
+
+代码位置很集中——`cross_fold_slice_rect()`（L193-220）里：
+
+```python
+y0 = (page_height - full_height) / 2      # 硬居中，忽略拖动的 y
+```
+
+`项目说明.md` 自己也写了做法：**"`y0` 已经独立成一行，把拖动得到的 y 传进去即可"**。
+
+**建议**：把 `cross_fold_slice_rect` 的垂直起点改为从 `stamp.position_for_page(page_index)` 取 y（与普通章同源），并放开 `drag_allowed_for_tags()`（L471-480）对骑缝切的拖拽拦截。同步要改：
+- `使用说明.md` 第五节第 7 条、Q5
+- `项目说明.md` 第三节功能表、第七节第 1 条
+- `tests\test_fixes.py` 的 `TestHCrossFold` 补一条「垂直偏移生效」断言
+
+> 这是**唯一一个"功能缺口"级别**的问题，其余都是性能/工程性。它还有现成的断言位（`TestHCrossFold` 已覆盖水平切片与对齐），补起来风险可控。
+
+---
+
+## 四、P1：长任务阻塞 UI 线程（"窗口像卡住"）
+
+`使用说明.md` 第七节第 4 条已经如实告知用户："导出会比较久，中途窗口看起来像卡住，请等状态栏和进度条出结果"。这是**已知体验问题，不是 bug**，但可以直接解决。
+
+### 问题
+
+- 单文件导出 `export_pdf()`（L2519）**完全同步执行**，导出期间窗口无法响应，Windows 可能标记"无响应"。
+- 批量导出 `export_batch_pdf()`（L2556）虽然每文件调一次 `self.root.update_idletasks()`，但**单文件内部的导出**仍是阻塞的。第 4 条实测里也说"一两百页以上会比较久"。
+- 全文 **没有任何 `threading`**（已 grep 确认），也没有 `after()` 轮询。
+
+### 建议
+
+1. **单文件导出**：放 worker 线程，主线程用 `root.after(100, poll)` 轮询进度，导出完成后 `messagebox` 提示。需要小心的三点：
+   - `fitz.Document` 非线程安全 → worker 里**自己 `fitz.open()` 一份**，不要跨线程共享 `self.pdf_doc`；
+   - 所有 Tk 调用只能在主线程（进度条/状态栏更新必须走 `after` 回主线程）；
+   - 加"取消"按钮——写临时文件 + `os.replace()` 的现有设计（L875-969）天然支持中断即回滚。
+2. **批量导出同理**，把 `update_idletasks()` 换成真正的线程 + 队列。
+
+---
+
+## 五、P2：渲染路径三项微优化（低风险、可独立验证）
+
+### 5.1 `dpi=` 换成 `matrix=`
+
+`get_pixmap(dpi=...)` 内部要先构造 `Matrix`。实测：
+
+| 写法 | 单页耗时 |
+|------|----------|
+| `get_pixmap(dpi=150, ...)` | **8.86 ms** |
+| `get_pixmap(matrix=fitz.Matrix(150/72, 150/72), ...)` | **7.59 ms** |
+
+**-14%**，改动就是缓存一个 `self._matrix`，零风险。
+
+### 5.2 `DisplayList` 预解析（翻页 / 反复渲染同页）
+
+实测：`page.get_pixmap` **4.25 ms** → `displaylist.get_pixmap` **2.48 ms**（同一页反复渲染，**-42%**）。
+
+`RenderCore` 目前对页面位图做了 LRU（`max_page_cache=8`），但**没缓存解析结果**。用户来回翻页、或改参数反复渲染同页时，每次都要重新解析页面内容流。
+
+`DisplayList` 对内存的占用远小于位图（位图 6.53 MB/页，见下表），可以比位图缓存大得多。
+
+> 注意 `DisplayList.get_pixmap` 的签名是 `(matrix, colorspace, alpha, clip)`，**不接受 `dpi=`**（实测报错），改的时候要一起换成 `matrix`——正好和 5.1 合并做。
+
+### 5.3 内存：位图缓存口径
+
+| 项目 | 实测值 | 口径 |
+|------|--------|------|
+| A4 单页位图（dpi=150, RGB） | **1240 × 1755 = 2.18 MP** | `get_pixmap` 输出 |
+| 单页 RGB 字节数 | **6.53 MB** | `w × h × 3` |
+| `max_page_cache=8` 满载 | **~52 MB** | 8 × 6.53 MB，纯 RGB 数据 |
+
+实测 EXE 常驻工作集 74.8 MB（`项目说明.md` 第六节），其中**约 52 MB 是页面位图缓存**。对 A4 合适，但**大幅面图纸（A0/A1）单页就是几十 MB**，8 页缓存会直接吃掉几百 MB。
+
+建议：`max_page_cache` 由**按页数**改为**按像素预算**（例如总量上限 64 MB，按实际 `w×h×3` 动态淘汰）。改动集中在 `RenderCore.get_page_bitmap`（L1254-1270），很小。
+
+---
+
+## 六、P2：一致性与可维护性（小改动、消隐患）
+
+### 6.1 `STAMP_EXT` 常量缺席
+
+`项目说明.md` 第七节第 2 条自己记着："代码里**没有** `STAMP_EXT` 常量"，对话框筛 `png jpg jpeg bmp gif`，但 `Image.open` 实际支持更广（webp/tiff/bmp…）。
+
+建议：引入 `STAMP_EXT` 单一来源，对话框与文档共用；或干脆改成 `("图片文件", "*.png *.jpg *.jpeg *.bmp *.gif *.webp *.tif *.tiff")` 并把 `使用说明.md` 第一条限制同步删掉。**顺带**：`eb8` 之前那批改动新引入的「复制为骑缝章」按钮名没写进 `项目说明.md`，一起补。
+
+### 6.2 `ExportOptions` 收口
+
+`export_pdf_with_stamps()` 有 8 个参数，其中 `cross_fold_mode` / `cross_fold_stamp_index` / `cross_fold_offset` 三个已被上一批改动**标记为旧路径**（GUI 里固定传 `cross_fold_mode=False, cross_fold_stamp_index=None, cross_fold_offset=0.5`）。
+
+但这个"3 个固定值"在 `export_pdf()`（L2545-2547）和 `export_batch_pdf()`（L2605-2607）里**各抄了一遍**，共 6 行噪声——将来改语义必然漏一处。
+
+建议：抽一个 `ExportOptions` dataclass（或让旧参数默认 `None` 并在内部走新路径），只保留 `underlay` 一个真正可变的开关。这也能让第九节那个"写脚本批量处理"的示例更干净。
+
+### 6.3 `PDFStamper` 类过大
+
+| 指标 | 实测 |
+|------|------|
+| `PDFStamper` 方法数 | **92 个** |
+| 行数 | 1,373–2,632（**1,260 行**） |
+| 最大方法 | `create_toolbar` **103 行**、`export_batch_pdf` **74 行**、`load_config` / `create_side_panel` **66 行** |
+
+（对比：纯逻辑层最"胖"的类是 `RenderCore`，9 个方法；模块级最大函数是 `export_pdf_with_stamps` 146 行。）
+
+架构分层是清晰的（逻辑层 / 类层 / GUI 层），问题只在 GUI 层单类聚合了 92 个方法。建议至少拆出：
+- `ToolbarBuilder` / `SidePanelBuilder`——把 `create_toolbar`(103) + `create_side_panel`(66) 的控件构造搬出去，只留事件绑定；
+- `BatchExporter`——`export_batch_pdf`(74) + `batch_output_paths` 的编排归属，顺带承载第四节的线程化。
+
+### 6.4 `export_pdf_with_stamps` 单函数 146 行
+
+L843-988，一口气做了 6 件事：路径校验 → 临时文件 → `insert_pdf` → 链接复制 → payload 生成 → 插图去重 → 兜底检测 → 保存 → 统计返回。其中**兜底检测那段（约 57 行）完全可以抽成独立函数** `_apply_underlay_fallback(new_doc, src_doc, payloads, sf)`，正好和第二节的优化合并做。
+
+---
+
+## 七、P3：能力扩展（文档"未来优化方向"里剩下没做的）
+
+这几条 `项目说明.md` 第九节已列过，此处只补评估角度：
+
+| 项目 | 现状 | 评估 |
+|------|------|------|
+| **CLI / 无人值守** | 无 `argparse`；但 `export_pdf_with_stamps()` / `batch_output_paths()` 已是纯函数 | **最容易做**的一条。加 `argparse` 包一层 `main()`，就能进 CI 做端到端回归（现在 CI 不构建 EXE、不跑端到端） |
+| **配置内嵌图片** | 依赖 `source_path`，图片移动/删除即报错（`使用说明.md` 第四节 Q 有记录） | 方案成熟：base64 内嵌进 JSON（体积变大）或"配置目录 + 相对路径 + 一键打包成 zip"。建议前者，实现最短 |
+| **基准留基线** | `tests\bench_render.py` 只打印不上报 | 输出 JSON + CI 存档，才能拦住性能回归。当前第五节那些"性能数字"全靠人工记 |
+| **补测空白口径** | `--onefile` 冷启动、导出总耗时、批量端到端、数百页内存峰值 —— 文档标"尚未实测" | 有了 CLI 后可自动测，两者互相成全 |
+
+---
+
+## 八、不建议动的（避免白干）
+
+1. **`dpi=150` 别为了"清晰"随手调高**。`项目说明.md` 第二节第 3 条说得很准：画布像素 = point × dpi/72，**改 dpi 会同时改变 x/y 的含义、导出除法、骑缝偏移**。真要支持"高分辨率导出"，应新增**独立的导出 dpi**，与预览 dpi 解耦，而不是调 `DEFAULT_RENDER_DPI`。
+2. **不加 `--optimize` 到 PyInstaller**。`项目说明.md` 第五节已说明官方不建议（会剥掉 `assert`/docstring），`tests\test_packaging.py` 也有断言守着。
+3. **不要为了"减少代码"合并逻辑层与类层**。现在能 `import pdf_stamper` 不创建窗口、能让 78 个用例直接断言，正是这层拆分的价值。
+
+---
+
+## 九、实测数据汇总（口径一览）
+
+| 项目 | 实测 | 口径 |
+|------|------|------|
+| 单页整页渲染 + 转 PIL（A4, dpi=150） | **8.86 ms** | `get_pixmap(dpi=150)` + `Image.frombytes` |
+| 同上，改 `matrix=` 传参 | **7.59 ms** | -14% |
+| 同上，`DisplayList` 复用 | **2.48 ms** | 相对 4.25 ms 的 `page.get_pixmap`，-42% |
+| 印章矩形局部渲染（200×200pt） | **2.32 ms** | vs 整页 11.26 ms，-79% |
+| `apply_opacity` 800×800 | **4.61 ms** | 每次重做 |
+| `rotate(expand=True, BICUBIC)` 800px | **1.71 ms** | — |
+| `resize(LANCZOS)` 800→400 | **18.04 ms** | 管线最大头 |
+| PNG 编码 800×800 | **8.92 ms** | 导出侧；预览不编码 |
+| 拖大小滑块 60 帧（1 个 800px 章） | **4,810 ms / 80 ms·帧** | 处理 + 编码串行 |
+| 3 个 600px 章 × 20 档缩放（冷缓存） | **578 ms / 9.6 ms·章·档** | 每档 cache miss |
+| 整页 Lanczos 缩 0.5× | **43.6 ms** | 对比 Bilinear 17.2 ms（2.5×） |
+| 导出兜底检测（30 页 × 2 次整页） | **~675 ms** | 外推；改局部后 ~140 ms，省 535 ms |
+| A4 单页位图（dpi=150） | **6.53 MB** | 1240×1755 RGB |
+| `max_page_cache=8` 满载 | **~52 MB** | 纯 RGB 数据 |
+
+> 以上均在本机 Windows 环境单次运行取平均（多数为 5–20 次迭代均值），不是统计学基准；不同文档差异大，**对外引用请带口径**。
+
+---
+
+## 十、和现有文档的关系（改完要同步哪里）
+
+按 `项目说明.md` 第十节的"文档维护规则"：
+
+| 若做了 | 必须同步 |
+|--------|----------|
+| 第一节（管线分级缓存）、第五节（渲染微优化） | `项目说明.md` 第六节性能（重跑 `tests\bench_render.py` 取新数字）；`bench_render.py` 建议加"滑块拖动"场景，否则测量不到这个热点 |
+| 第二节（局部渲染检测） | `项目说明.md` 第五节打包事实（导出耗时口径）；补端到端导出耗时实测 |
+| 第三节（骑缝章垂直可调） | `项目说明.md` 第三节功能表 + 第七节第 1 条 + 第九节（移除该条）；`使用说明.md` 第五节第 7 条 + Q5；`tests\test_fixes.py` 的 `TestHCrossFold` 补断言 |
+| 第六节 6.1（`STAMP_EXT`） | `项目说明.md` 第七节第 2 条；`使用说明.md` 第一节"不能做"第 2 条 |
+| 任何一次改动 | 第三节功能表、第四节测试用例数与实跑记录、窗口标题版本号 ✅ |
+
+> ⚠️ **提醒**：截至本文，工作区仍有 5 个文件**未提交**（`pdf_stamper.py` / `build_exe.py` / `tests\test_fixes.py` / `tests\test_gui_smoke.py` / `使用说明.md`），且 `项目说明.md` **尚未同步**上一批改动。建议**先提交现状、再合并文档、然后按本文优先级动手**，否则后面每一个优化都会叠在未归档的改动上，`git diff` 会越看越难。
+
+---
+
+**版本**：评估报告 v1.0 — 2026-09-27
+**评估对象**：`pdf_stamper.py` 2,668 行（工作区状态，HEAD = `ae3c928`）
+**测试状态**：本次未改任何产品代码；已复核 `test_core.py` ALL PASS、`unittest discover -s tests` 78 用例 OK、GUI smoke 10 用例 OK
