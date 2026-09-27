@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PDF盖章工具 v3.1 - 修复项验收测试（A-H 逐项断言）
+PDF盖章工具 v3.3 - 修复项验收测试（A-H 逐项断言 + 优化/并发回归）
 
 只测纯逻辑层（不启动 Tk 主循环，不实例化 PDFStamper）。
 运行：
@@ -13,6 +13,8 @@ import io
 import os
 import sys
 import tempfile
+import threading
+import time
 import unittest
 
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1185,6 +1187,214 @@ class TestExportOptions(TempArtifactMixin):
         # GUI 里不再硬编码扩展名清单
         load_src = inspect.getsource(ps.PDFStamper.load_stamp)
         self.assertIn("STAMP_FILE_DIALOG_TYPES", load_src)
+
+
+class TestExportJobAndCancel(TempArtifactMixin):
+    """
+    后台导出任务：线程调度、取消、密码回执、异常回传。
+
+    这些用例**不创建 Tk**：ExportJob 的事件队列与回执机制刻意做成不依赖 GUI，
+    测试自己扮演主线程（drain 事件 + 回复密码），从而能断言整条链路。
+    """
+
+    @staticmethod
+    def _drain_until(job, predicate, timeout=10.0):
+        """扮演主线程：反复 drain 事件直到 predicate 满足，返回所有收到的事件。"""
+        collected = []
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            events, finished = job.poll()
+            collected.extend(events)
+            if predicate(collected, finished):
+                return collected
+            time.sleep(0.005)
+        return collected
+
+    def test_worker_runs_and_returns_result(self):
+        job = ps.ExportJob(lambda j: 6 * 7)
+        job.start()
+        self._drain_until(job, lambda ev, fin: fin)
+        self.assertTrue(job.done)
+        self.assertEqual(job.result, 42)
+        self.assertIsNone(job.error)
+        self.assertFalse(job.cancelled_flag)
+
+    def test_cancel_marks_cancelled_not_error(self):
+        """取消不是错误：cancelled_flag 置位、error 保持 None。"""
+        def worker(job):
+            job.cancel()                       # 模拟用户已点「取消导出」
+            ps._check_cancel(lambda: job.cancelled)
+            return "unreachable"
+
+        job = ps.ExportJob(worker)
+        job.start()
+        self._drain_until(job, lambda ev, fin: fin)
+        self.assertTrue(job.cancelled_flag)
+        self.assertIsNone(job.error)
+        self.assertIsNone(job.result)
+
+    def test_worker_exception_is_captured_not_raised(self):
+        """worker 里的异常必须带回主线程（否则线程里静默丢失）。"""
+        def worker(job):
+            raise ValueError("boom")
+
+        job = ps.ExportJob(worker)
+        job.start()
+        self._drain_until(job, lambda ev, fin: fin)
+        self.assertIsInstance(job.error, ValueError)
+        self.assertFalse(job.cancelled_flag)
+
+    def test_progress_and_status_events_reach_the_main_thread(self):
+        def worker(job):
+            job.post("status", text="正在处理")
+            job.post("progress", value=3, maximum=10)
+            return None
+
+        job = ps.ExportJob(worker)
+        job.start()
+        events = self._drain_until(job, lambda ev, fin: fin)
+        kinds = [k for k, _ in events]
+        self.assertIn("status", kinds)
+        self.assertIn("progress", kinds)
+        progress = [p for k, p in events if k == "progress"][0]
+        self.assertEqual((progress["value"], progress["maximum"]), (3, 10))
+
+    def test_ask_password_round_trip_blocks_worker_until_reply(self):
+        """worker 请求密码后必须阻塞，直到主线程回执。"""
+        seen = {}
+
+        def worker(job):
+            seen["reply"] = job.ask_password("secret.pdf")
+            return "finished"
+
+        job = ps.ExportJob(worker)
+        job.start()
+        asked = self._drain_until(
+            job, lambda ev, fin: any(k == "ask_password" for k, _ in ev))
+        self.assertTrue(any(k == "ask_password" for k, _ in asked))
+        # 还没回执时 worker 必须仍卡着
+        self.assertFalse(job.done, "未回执前 worker 不应结束")
+        job.answer_password("hunter2")
+        self._drain_until(job, lambda ev, fin: fin)
+        self.assertEqual(seen["reply"], "hunter2")
+        self.assertEqual(job.result, "finished")
+
+    def test_ask_password_cancel_returns_none(self):
+        """用户取消密码框（回执 None）时 worker 应能拿到 None 并自行决定退出。"""
+        seen = {}
+
+        def worker(job):
+            seen["reply"] = job.ask_password("secret.pdf")
+
+        job = ps.ExportJob(worker)
+        job.start()
+        self._drain_until(job, lambda ev, fin: any(k == "ask_password" for k, _ in ev))
+        job.answer_password(None)
+        self._drain_until(job, lambda ev, fin: fin)
+        self.assertIsNone(seen["reply"])
+
+    def test_cancel_check_aborts_export_and_keeps_existing_target(self):
+        """取消发生在 os.replace 之前 —— 已存在的目标文件必须原样保留。"""
+        sf = ps.canvas_scale()
+        stamp = ps.StampConfig(make_solid_stamp(120), "章")
+        stamp.x, stamp.y = 100, 120
+        with tempfile.TemporaryDirectory(prefix="cancel_export_") as work_dir:
+            source_path = os.path.join(work_dir, "source.pdf")
+            output_path = os.path.join(work_dir, "result.pdf")
+            make_src_pdf(source_path, pages=20)
+            with open(output_path, "wb") as stream:
+                stream.write(b"ORIGINAL TARGET")
+            source, status = ps.open_pdf_document(source_path)
+            self.assertEqual(status, ps.OPEN_OK)
+            calls = {"n": 0}
+
+            def cancel_check():
+                calls["n"] += 1
+                return calls["n"] > 3          # 前 3 个检查点放行，之后取消
+
+            try:
+                with self.assertRaises(ps.ExportCancelled):
+                    ps.export_pdf_with_stamps(source, [stamp], output_path,
+                                              scale_factor=sf, cancel_check=cancel_check)
+            finally:
+                source.close()
+            self.assertGreater(calls["n"], 3, "取消回调应被多次调用（每页/每章都有检查点）")
+            with open(output_path, "rb") as stream:
+                self.assertEqual(stream.read(), b"ORIGINAL TARGET",
+                                 "取消后目标文件不得被改动")
+            leftovers = [name for name in os.listdir(work_dir)
+                         if name.startswith(".pdf_stamper_")]
+            self.assertEqual(leftovers, [], "取消后临时文件应被清理")
+
+    def test_cancel_check_none_means_never_cancel(self):
+        """不传 cancel_check 时行为与旧版一致。"""
+        sf = ps.canvas_scale()
+        stamp = ps.StampConfig(make_solid_stamp(80), "章")
+        stamp.x, stamp.y = 60, 80
+        report = ps.export_pdf_with_stamps(
+            self.open_src(), [stamp], os.path.join(OUT_DIR, "no_cancel.pdf"),
+            scale_factor=sf)
+        self.assertEqual(report["page_count"], 3)
+        self.assertEqual(len(report["embedded"]), 3)
+
+    def test_snapshot_stamps_isolates_from_later_edits(self):
+        """快照后改原章不应影响快照（导出用的是点按钮那一刻的参数）。"""
+        original = ps.StampConfig(make_solid_stamp(100), "原章")
+        original.x, original.y, original.scale = 10, 20, 1.0
+        original.page_scope = "all"
+        snapshot = ps.snapshot_stamps([original])
+        self.assertEqual(len(snapshot), 1)
+        clone = snapshot[0]
+        self.assertIsNot(clone, original)
+        self.assertIsNot(clone.img, original.img, "图像也要复制，避免共享可变像素")
+        original.x, original.scale = 999, 2.5
+        original.page_scope = "first"
+        original.is_cross_fold = True
+        self.assertEqual((clone.x, clone.y), (10, 20))
+        self.assertAlmostEqual(clone.scale, 1.0)
+        self.assertEqual(clone.page_scope, "all")
+        self.assertFalse(clone.is_cross_fold)
+
+    def test_snapshot_stamps_copies_page_positions(self):
+        stamp = ps.StampConfig(make_solid_stamp(60), "分页章")
+        stamp.set_position_for_page(2, 33, 44)
+        clone = ps.snapshot_stamps([stamp])[0]
+        self.assertEqual(clone.position_for_page(2), (33.0, 44.0))
+        stamp.set_position_for_page(2, 1, 1)
+        self.assertEqual(clone.position_for_page(2), (33.0, 44.0), "字典也要深拷一层")
+
+    def test_export_pdf_with_stamps_is_reentrant_from_two_threads(self):
+        """两个线程同时导出各自的文档：结果互不干扰（fitz 非线程安全 -> 各开一份）。"""
+        sf = ps.canvas_scale()
+        results = {}
+        errors = []
+
+        def run(name, color):
+            try:
+                stamp = ps.StampConfig(Image.new("RGBA", (70, 70), color), name)
+                stamp.x, stamp.y = 40, 50
+                with tempfile.TemporaryDirectory(prefix="thread_export_") as work_dir:
+                    source_path = os.path.join(work_dir, "s.pdf")
+                    make_src_pdf(source_path, pages=4)
+                    doc, status = ps.open_pdf_document(source_path)
+                    assert status == ps.OPEN_OK, status
+                    try:
+                        report = ps.export_pdf_with_stamps(
+                            doc, [stamp], os.path.join(work_dir, "o.pdf"), scale_factor=sf)
+                    finally:
+                        doc.close()
+                    results[name] = (report["page_count"], len(report["embedded"]))
+            except BaseException as exc:        # noqa: BLE001
+                errors.append((name, exc))
+
+        threads = [threading.Thread(target=run, args=("a", (255, 0, 0, 255))),
+                   threading.Thread(target=run, args=("b", (0, 0, 255, 255)))]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+        self.assertEqual(errors, [])
+        self.assertEqual(results, {"a": (4, 4), "b": (4, 4)})
 
 
 class TestBatchWorkflow(TempArtifactMixin):

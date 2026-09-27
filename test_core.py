@@ -327,7 +327,7 @@ def test_render_cache(pdf_path, stamp_img):
 
 def main():
     print("=" * 68)
-    print("PDF盖章工具 - 核心功能测试（v3.2，带断言）")
+    print("PDF盖章工具 - 核心功能测试（v3.3，带断言）")
     print("=" * 68)
     os.makedirs(OUT_DIR, exist_ok=True)
     print("Python %s / PyMuPDF %s / 输出目录 %s"
