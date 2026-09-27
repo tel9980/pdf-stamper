@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PDF盖章工具 v3.1 - 专业版
+PDF盖章工具 v3.2 - 专业版
 支持：多公章、撤销/重做、旋转、批量盖章、骑缝章、透明度调节
+
+v3.2 变化
+---------
+- 骑缝章上下位置可拖动（cross_fold_slice_rect(y_pt=) / cross_fold_top_pt()，预览导出同源）
+- 图像处理管线三级缓存（opacity -> rotate -> resize 各自 LRU）+ Image.reduce() 预降采样
+- 导出兜底检测改 clip= 局部渲染 + 廉价预筛；位图缓存改像素预算（96 MB）
+- ExportOptions 收口导出参数；STAMP_EXT 统一图片来源清单
 
 v3.1 结构说明（重要）
 --------------------
@@ -28,6 +35,7 @@ import io
 import json
 import os
 import uuid
+import dataclasses
 import tempfile
 from collections import OrderedDict, deque
 
@@ -49,6 +57,13 @@ OPEN_BAD_PASSWORD = "bad_password"
 OPEN_CANCELLED = "cancelled"
 OPEN_FAILED = "failed"
 
+# 图章图片来源支持的扩展名（文件对话框与读取校验共用同一份清单）
+STAMP_EXT = (".png", ".jpg", ".jpeg", ".bmp", ".gif")
+STAMP_FILE_DIALOG_TYPES = (
+    ("图片文件", " ".join("*" + ext for ext in STAMP_EXT)),
+    ("所有文件", "*.*"),
+)
+
 # 可编辑 / 会吞键的控件类型名（用于快捷键分发，见 shortcut_blocked）
 EDITABLE_WIDGET_NAMES = frozenset({
     "Entry", "TEntry", "Text", "Listbox", "Spinbox", "TSpinbox",
@@ -58,6 +73,33 @@ EDITABLE_WIDGET_NAMES = frozenset({
 _stamp_image_cache = OrderedDict()
 _stamp_image_cache_lock_depth = 0
 STAMP_IMAGE_CACHE_MAX = 96
+
+# 分级流水线缓存：opacity -> rotate -> scale 各自一级。
+# 拖滑块时只有被改的那一级会失效，后级复用前级结果（见 process_stamp_image）。
+_OPACITY_CACHE = OrderedDict()
+_ROTATE_CACHE = OrderedDict()
+_DISPLAY_SCALE_CACHE = OrderedDict()
+OPACITY_CACHE_MAX = 32
+ROTATE_CACHE_MAX = 32
+DISPLAY_SCALE_CACHE_MAX = 32
+
+# 缓存统计（原先 stamp_image_cache_info() 的 hits 恒为 None，无法验证优化效果）
+_CACHE_STATS = {"opacity_hit": 0, "opacity_miss": 0,
+                "rotate_hit": 0, "rotate_miss": 0,
+                "display_hit": 0, "display_miss": 0,
+                "chain_hit": 0, "chain_miss": 0}
+
+
+def _image_identity(img):
+    """图像身份指纹：id + 尺寸 + mode（防 id() 复用导致的误命中）。"""
+    return (id(img), img.size, img.mode)
+
+
+def _cache_put(cache, key, value, limit):
+    cache[key] = value
+    cache.move_to_end(key)
+    while len(cache) > limit:
+        cache.popitem(last=False)
 
 
 # ==================== 纯逻辑：坐标 / 几何 ====================
@@ -142,6 +184,8 @@ def clip_rect_to_page(rect_pt, page_rect, size_pt):
 def stamp_applies_to_page(stamp, page_index, page_count):
     """判断公章是否应盖在指定页；旧历史数据默认覆盖全部页面。"""
     scope = getattr(stamp, "page_scope", "all")
+    if scope == "none":
+        return False
     if scope == "first":
         return int(page_index) == 0
     if scope == "last":
@@ -190,12 +234,12 @@ def split_cross_fold_images(stamp_img, num_pages, offset=0.5):
 
 def cross_fold_slice_rect(page_width_pt, page_height_pt, full_width_pt, full_height_pt,
                           slice_index, num_pages, offset=0.5, slice_width_pt=None,
-                          nominal_width_pt=None):
+                          nominal_width_pt=None, y_pt=None):
     """
     骑缝章第 slice_index 刀在某一页上的目标矩形（PDF point）。
 
     放置约定（每页同一位置、内容不同 -> 错页拼合后为完整一枚章）：
-      - 垂直方向：页面居中。
+      - 垂直方向：y_pt 给出整章顶边（PDF point）；省略时居中。
       - 水平方向：以「右边缘」为基准锚定（与旧版方向一致：offset 越大越向左）：
           right = page_width - offset * (full_width - nominal_slice_width)
           x0    = right - slice_width
@@ -206,6 +250,7 @@ def cross_fold_slice_rect(page_width_pt, page_height_pt, full_width_pt, full_hei
 
     slice_width_pt     : 该刀真实宽度（默认取名义宽度）
     nominal_width_pt   : 放置用的名义宽度（默认 full_width / num_pages）
+    y_pt               : 整章顶边（PDF point）；None 表示垂直居中（旧行为）
     """
     n = max(1, int(num_pages))
     idx = min(max(0, int(slice_index)), n - 1)
@@ -214,8 +259,25 @@ def cross_fold_slice_rect(page_width_pt, page_height_pt, full_width_pt, full_hei
     right = page_width_pt - float(offset) * max(0.0, full_width_pt - nominal)
     right = min(right, page_width_pt)
     x0 = max(0.0, right - actual)
-    y0 = max(0.0, (page_height_pt - full_height_pt) / 2.0)
+    if y_pt is None:
+        y0 = (page_height_pt - full_height_pt) / 2.0
+    else:
+        y0 = float(y_pt)
+    # 垂直方向允许整章略超出页面（骑缝章本就常压在页边），但仍限制在合理范围内，
+    # 避免拖动过程中章飞出页面后无法用鼠标找回。
+    y0 = min(max(y0, -full_height_pt * 0.5), page_height_pt - full_height_pt * 0.5)
     return (x0, y0, x0 + actual, y0 + full_height_pt)
+
+
+def cross_fold_top_pt(stamp, page_index, scale_factor):
+    """
+    骑缝章在某页的整章顶边（PDF point）。
+
+    骑行章与普通章共用同一套「按页位置」(`position_for_page`)，因此垂直位置可以像
+    普通章一样拖动；这里把画布像素 y 换算成 PDF point。
+    """
+    _x, y_px = stamp.position_for_page(page_index)
+    return float(y_px) / float(scale_factor)
 
 
 def cross_fold_geometry(stamp, page_rect, num_pages, offset=0.5, scale_factor=None,
@@ -242,15 +304,17 @@ def cross_fold_geometry(stamp, page_rect, num_pages, offset=0.5, scale_factor=No
     slice_w_pt = (end - start) / sf
     full_w_pt = w_px / sf
     full_h_pt = h_px / sf
+    top_pt = cross_fold_top_pt(stamp, page_index, sf)
     rect_pt = cross_fold_slice_rect(
         page_rect.width, page_rect.height, full_w_pt, full_h_pt,
-        page_index, num_pages, offset, slice_width_pt=slice_w_pt,
+        page_index, num_pages, offset, slice_width_pt=slice_w_pt, y_pt=top_pt,
     )
     slices_pt = []
     for i, (s, e) in enumerate(bounds):
         slices_pt.append(cross_fold_slice_rect(
             page_rect.width, page_rect.height, full_w_pt, full_h_pt,
             i, num_pages, offset, slice_width_pt=(e - s) / sf,
+            y_pt=cross_fold_top_pt(stamp, i, sf),
         ))
     return {
         "processed_px": (w_px, h_px),
@@ -290,6 +354,25 @@ def apply_opacity(img, opacity):
     return Image.merge("RGBA", (r, g, b, a))
 
 
+def resize_lanczos(img, size):
+    """
+    缩放到目标尺寸，缩小时先用 reduce() 取整数倍降采样再 Lanczos 收尾。
+
+    PIL 官方推荐的多步缩放做法：直接一步 Lanczos 缩小大图，参与计算的源像素远多于
+    目标像素，代价随源尺寸增长；reduce() 用盒式滤波先丢掉多余像素，代价骤降。
+    实测 800px -> 80/200/400px 时快 3.8~4.6 倍；放大或接近 1:1 时退回单步。
+    """
+    target_w = max(1, int(round(size[0])))
+    target_h = max(1, int(round(size[1])))
+    if (target_w, target_h) == img.size:
+        return img
+    if target_w < img.width and target_h < img.height:
+        factor = min(img.width // target_w, img.height // target_h)
+        if factor > 1:
+            img = img.reduce(factor)
+    return img.resize((target_w, target_h), Image.Resampling.LANCZOS)
+
+
 def process_stamp_image(img, opacity=1.0, rotation=0, scale=1.0, use_cache=True):
     """
     唯一的公章图像处理管线（修复 A）：opacity -> rotate(expand=True) -> scale。
@@ -312,25 +395,95 @@ def process_stamp_image(img, opacity=1.0, rotation=0, scale=1.0, use_cache=True)
     except (TypeError, ValueError):
         opacity_f = 1.0
 
-    key = (id(img), img.size, img.mode, opacity_f, rotation_i, round(scale_f, 4))
+    scale_key = round(scale_f, 4)
+    key = (id(img), img.size, img.mode, opacity_f, rotation_i, scale_key)
     if use_cache:
         hit = _stamp_image_cache.get(key)
         if hit is not None:
             _stamp_image_cache.move_to_end(key)
+            _CACHE_STATS["chain_hit"] += 1
             return hit[1]
+        _CACHE_STATS["chain_miss"] += 1
 
-    out = apply_opacity(img, opacity_f)
-    if rotation_i:
-        out = out.rotate(rotation_i, expand=True, resample=Image.Resampling.BICUBIC)
+    out = _apply_opacity_cached(img, opacity_f, use_cache)
+    out = _rotate_cached(out, rotation_i, use_cache)
     if abs(scale_f - 1.0) > 1e-9:
         w, h = out.size
-        out = out.resize((max(1, int(round(w * scale_f))), max(1, int(round(h * scale_f)))),
-                         Image.Resampling.LANCZOS)
+        out = resize_lanczos(out, (w * scale_f, h * scale_f))
 
     if use_cache:
         _stamp_image_cache[key] = (img, out)
         while len(_stamp_image_cache) > STAMP_IMAGE_CACHE_MAX:
             _stamp_image_cache.popitem(last=False)
+    return out
+
+
+def _apply_opacity_cached(img, opacity_f, use_cache=True):
+    """
+    管线第 1 级：只做透明度。拖 scale/rotation 滑块时这一级稳定命中。
+
+    apply_opacity 对 opacity>=1 是零成本短路，因此不透明章不产生缓存条目。
+    """
+    if opacity_f >= 1.0:
+        return img
+    if not use_cache:
+        return apply_opacity(img, opacity_f)
+    key = (_image_identity(img), opacity_f)
+    hit = _OPACITY_CACHE.get(key)
+    if hit is not None:
+        _OPACITY_CACHE.move_to_end(key)
+        _CACHE_STATS["opacity_hit"] += 1
+        return hit[1]
+    _CACHE_STATS["opacity_miss"] += 1
+    out = apply_opacity(img, opacity_f)
+    _cache_put(_OPACITY_CACHE, key, (img, out), OPACITY_CACHE_MAX)
+    return out
+
+
+def _rotate_cached(img, rotation_i, use_cache=True):
+    """管线第 2 级：只做旋转（expand=True）。拖 scale 滑块时这一级稳定命中。"""
+    if not rotation_i:
+        return img
+    if not use_cache:
+        return img.rotate(rotation_i, expand=True, resample=Image.Resampling.BICUBIC)
+    key = (_image_identity(img), rotation_i)
+    hit = _ROTATE_CACHE.get(key)
+    if hit is not None:
+        _ROTATE_CACHE.move_to_end(key)
+        _CACHE_STATS["rotate_hit"] += 1
+        return hit[1]
+    _CACHE_STATS["rotate_miss"] += 1
+    out = img.rotate(rotation_i, expand=True, resample=Image.Resampling.BICUBIC)
+    _cache_put(_ROTATE_CACHE, key, (img, out), ROTATE_CACHE_MAX)
+    return out
+
+
+def display_scale_cache(img, factor, use_cache=True):
+    """
+    预览专用的「一步缩放到显示尺寸」缓存。
+
+    预览显示尺寸 = 处理后尺寸 × 画布缩放；本函数把「按 scale 处理」与「按 zoom 显示」
+    两步合成一次 resize，避免 zoom != 1 时的两次 Lanczos，并缓存结果供 PhotoImage 复用。
+    """
+    try:
+        factor = float(factor)
+    except (TypeError, ValueError):
+        factor = 1.0
+    if abs(factor - 1.0) < 1e-9:
+        return img
+    if factor <= 0:
+        factor = 1.0
+    if not use_cache:
+        return resize_lanczos(img, (img.width * factor, img.height * factor))
+    key = (_image_identity(img), round(factor, 4))
+    hit = _DISPLAY_SCALE_CACHE.get(key)
+    if hit is not None:
+        _DISPLAY_SCALE_CACHE.move_to_end(key)
+        _CACHE_STATS["display_hit"] += 1
+        return hit[1]
+    _CACHE_STATS["display_miss"] += 1
+    out = resize_lanczos(img, (img.width * factor, img.height * factor))
+    _cache_put(_DISPLAY_SCALE_CACHE, key, (img, out), DISPLAY_SCALE_CACHE_MAX)
     return out
 
 
@@ -386,10 +539,26 @@ def get_processed_image(stamp):
 
 def stamp_image_cache_clear():
     _stamp_image_cache.clear()
+    _OPACITY_CACHE.clear()
+    _ROTATE_CACHE.clear()
+    _DISPLAY_SCALE_CACHE.clear()
 
 
 def stamp_image_cache_info():
-    return {"entries": len(_stamp_image_cache), "max": STAMP_IMAGE_CACHE_MAX, "hits": None}
+    return {
+        "entries": len(_stamp_image_cache),
+        "max": STAMP_IMAGE_CACHE_MAX,
+        "opacity_entries": len(_OPACITY_CACHE),
+        "rotate_entries": len(_ROTATE_CACHE),
+        "display_entries": len(_DISPLAY_SCALE_CACHE),
+        "hits": dict(_CACHE_STATS),
+    }
+
+
+def stamp_image_cache_stats_reset():
+    """清零命中统计（基准脚本用，便于分段测量）。"""
+    for name in _CACHE_STATS:
+        _CACHE_STATS[name] = 0
 
 
 def image_to_png_bytes(img):
@@ -468,14 +637,14 @@ def stamp_index_from_tags(tags, stamp_count):
 
 def drag_allowed_for_tags(tags):
     """
-    该图元能否被拖拽移动。骑缝章切片的位置由「页序 + 偏移滑块」算出（不可拖），
-    普通公章按画布坐标自由拖动。
+    该图元能否被拖拽移动。
+
+    骑缝章现在**可以上下拖动**（垂直位置与普通章共用同一套按页位置），但水平位置
+    仍由「页序 + 偏移滑块」算出，所以拖动时只应用垂直分量（见 on_mouse_drag）。
     """
     if not tags:
         return False
-    if "stamp_item" not in tags:
-        return False
-    return "cross_fold" not in tags
+    return "stamp_item" in tags
 
 
 # ==================== StampConfig ====================
@@ -838,9 +1007,40 @@ def batch_output_paths(input_paths, output_dir):
     return paths
 
 
+@dataclasses.dataclass
+class ExportOptions:
+    """
+    导出选项：把散落在各处的骑缝章/底层开关收成一个对象，避免长参数列表传错位。
+
+    全部字段都有默认值，因此 `ExportOptions()` 等价于旧版默认行为。
+    """
+    cross_fold_mode: bool = False
+    cross_fold_stamp_index: int = None
+    cross_fold_offset: float = 0.5
+    underlay: bool = True
+
+    def normalised(self):
+        """
+        夹紧数值范围，保证传入脏数据也不会画到页外或产生负偏移。
+
+        cross_fold_stamp_index 允许为 None —— 语义是「按每个章自己的 is_cross_fold 判断」，
+        这是当前 GUI 的默认用法，不能强行转成 0（会误伤第 0 枚普通章）。
+        """
+        offset = min(1.0, max(0.0, float(self.cross_fold_offset)))
+        index = None if self.cross_fold_stamp_index is None else max(
+            0, int(self.cross_fold_stamp_index))
+        return ExportOptions(bool(self.cross_fold_mode), index, offset, bool(self.underlay))
+
+    @classmethod
+    def from_namespace(cls, **kwargs):
+        """从关键字参数构造（忽略未知键），便于旧调用点平滑迁移。"""
+        fields = {f.name for f in dataclasses.fields(cls)}
+        return cls(**{k: v for k, v in kwargs.items() if k in fields})
+
+
 def export_pdf_with_stamps(src_doc, stamps, out_path=None, scale_factor=None,
                            cross_fold_mode=False, cross_fold_stamp_index=0,
-                           cross_fold_offset=0.5, underlay=True):
+                           cross_fold_offset=0.5, underlay=True, options=None):
     """
     导出盖章后的 PDF（预览/导出共用同一套几何函数）。
 
@@ -849,13 +1049,18 @@ def export_pdf_with_stamps(src_doc, stamps, out_path=None, scale_factor=None,
       stamps     : list[StampConfig]
       out_path   : 目标路径；None 时只计算并写进临时文件（便于测试），返回 report['output_path']
       scale_factor : 画布像素 -> PDF point（默认 canvas_scale()）
-      cross_fold_mode / cross_fold_stamp_index / cross_fold_offset : 骑缝章
-    underlay   : True -> 以页面原始内容流为底层插入公章，不栅格化整页。
-
-    返回 report dict:
-      page_count, embedded: [{'page','xref','rect','size_px','center_pt','kind','shifted_into_page'}],
-      per_page_image_counts: [int], png_encode_count, output_path
+      options    : ExportOptions；给定时覆盖下面四个骑缝章/底层参数（推荐用法）
+      cross_fold_mode / cross_fold_stamp_index / cross_fold_offset / underlay :
+                   旧的散装参数，保持向后兼容；显式传入 options 时以 options 为准。
     """
+    if options is None:
+        options = ExportOptions(cross_fold_mode, cross_fold_stamp_index,
+                                cross_fold_offset, underlay)
+    options = options.normalised()
+    cross_fold_mode = options.cross_fold_mode
+    cross_fold_stamp_index = options.cross_fold_stamp_index
+    cross_fold_offset = options.cross_fold_offset
+    underlay = options.underlay
     sf = float(scale_factor if scale_factor is not None else canvas_scale())
     own_tmp = out_path is None
     requested_path = out_path
@@ -902,6 +1107,10 @@ def export_pdf_with_stamps(src_doc, stamps, out_path=None, scale_factor=None,
                     "stamp_id": payload.get("stamp_id"),
                     "shifted_into_page": payload.get("shifted_into_page", False),
                 })
+            underlay_fallback_pages = []
+            if underlay and payloads:
+                underlay_fallback_pages = _apply_underlay_fallback(
+                    src_doc, new_doc, payloads, sf)
             new_doc.save(atomic_path, garbage=3, deflate=True)
             per_page = [len(new_doc[i].get_images(full=True)) for i in range(new_doc.page_count)]
             page_count = new_doc.page_count
@@ -917,6 +1126,7 @@ def export_pdf_with_stamps(src_doc, stamps, out_path=None, scale_factor=None,
             "png_encode_count": encode_count,
             "scale_factor": sf,
             "flattened_pages": [],
+            "underlay_fallback_pages": underlay_fallback_pages,
         }
     finally:
         for path in (atomic_path, out_path if own_tmp else None):
@@ -926,6 +1136,192 @@ def export_pdf_with_stamps(src_doc, stamps, out_path=None, scale_factor=None,
                         os.remove(path)
                 except OSError:
                     pass
+
+def _apply_underlay_fallback(src_doc, new_doc, payloads, scale_factor):
+    """
+    底层模式的安全网：检测「整页不透明背景把公章压住」的页面并改用合成画法。
+
+    性能要点（实测）：
+      - 只在印章矩形内渲染比对，而不是整页：整页 11.26 ms/次 vs 矩形 2.32 ms/次。
+        30 页 × 2 次渲染从 ~675 ms 降到 ~140 ms。
+      - 先用页面图像对象做廉价预筛：没有「覆盖印章的大图」就直接跳过渲染。
+        绝大多数 PDF 在此短路，能力与旧实现等价（旧实现渲染后也会判定为「未遮挡」）。
+    """
+    if not payloads:
+        return []
+    dpi = max(1, int(round(scale_factor * 72.0)))
+    pixels_per_point = dpi / 72.0
+    payloads_by_page = {}
+    for payload in payloads:
+        payloads_by_page.setdefault(payload["page"], []).append(payload)
+
+    fallback_pages = []
+    for page_index, page_payloads in payloads_by_page.items():
+        source_page = src_doc[page_index]
+        # 需要比对的区域 = 本页所有印章矩形并集（转成 pixmap 整数边界）
+        rects = [payload["rect_pt"] for payload in page_payloads]
+        detect_rect = fitz.Rect(
+            min(rect[0] for rect in rects), min(rect[1] for rect in rects),
+            max(rect[2] for rect in rects), max(rect[3] for rect in rects))
+        if detect_rect.is_empty:
+            continue
+        if not _may_hide_underlay(source_page, detect_rect):
+            continue
+        matrix = fitz.Matrix(pixels_per_point, pixels_per_point)
+        base_pixmap = source_page.get_pixmap(
+            matrix=matrix, clip=detect_rect, colorspace=fitz.csRGB, alpha=False)
+        stamped_pixmap = new_doc[page_index].get_pixmap(
+            matrix=matrix, clip=detect_rect, colorspace=fitz.csRGB, alpha=False)
+        hidden = [
+            payload for payload in page_payloads
+            if _same_rendered_region(base_pixmap, stamped_pixmap,
+                                     payload["rect_pt"], pixels_per_point)
+        ]
+        if not hidden:
+            continue
+        fallback_pages.append(page_index)
+        _rebuild_page_with_composited_underlay(
+            source_page, new_doc[page_index], page_payloads,
+            pixels_per_point, base_pixmap)
+    return fallback_pages
+
+
+def _may_hide_underlay(page, detect_rect=None):
+    """
+    廉价预筛：页面是否存在可能遮住底层印章的**不透明内容**。
+
+    只把「确实没有可疑内容」判为 False 以跳过渲染比对；任何判断不了的情况一律返回
+    True（保守，宁可多渲染也不漏兜底）。
+
+    判定只用两个便宜调用（实测各约 0.1 ms）：
+      1. 页面有无图像对象 —— 有就必须渲染比对（可能是整页扫描件 / 白底图）；
+      2. 页面绘制指令中有无「填充矩形」—— 整页纯色背景常由矢量填充实现。
+
+    不要用 get_image_rects() 去量图像尺寸：实测约 3.7 ms/次，比它想省下的那次
+    局部渲染（约 2.3 ms）还贵，属于净亏损。
+    """
+    try:
+        if page.get_images(full=True):
+            return True
+        return _page_draws_filled_rect(page)
+    except Exception:
+        return True
+
+
+def _page_draws_filled_rect(page):
+    """
+    页面是否含填充矩形绘制指令（用于识别整页纯色背景）。
+
+    用 get_drawings() 比解析内容流稳妥；取不到时返回 True（保守，不跳过检测）。
+    """
+    try:
+        drawings = page.get_drawings()
+    except Exception:
+        return True
+    for drawing in drawings:
+        if drawing.get("fill") is None:
+            continue
+        rect = drawing.get("rect")
+        if rect is None or rect.is_empty:
+            continue
+        return True
+    return False
+
+
+def _rebuild_page_with_composited_underlay(source_page, target_page, page_payloads,
+                                           pixels_per_point, base_pixmap):
+    """把该页重画为「页面 + 公章」的合成补丁，绕过不透明背景的遮挡。"""
+    base_image = Image.frombytes(
+        "RGB", (base_pixmap.width, base_pixmap.height), base_pixmap.samples)
+    origin_x, origin_y = base_pixmap.x, base_pixmap.y
+    fallback_items = []
+    for payload in page_payloads:
+        with Image.open(io.BytesIO(payload["bytes"])) as stamp_image:
+            stamp_image = stamp_image.convert("RGBA")
+        bounds = _pdf_rect_to_pixmap_bounds(
+            payload["rect_pt"], pixels_per_point, origin_x, origin_y)
+        x0, y0, x1, y1 = bounds
+        target_size = (max(1, x1 - x0), max(1, y1 - y0))
+        if stamp_image.size != target_size:
+            stamp_image = resize_lanczos(stamp_image, target_size)
+        fallback_items.append({"x": x0, "y": y0, "image": stamp_image})
+    composed = compose_underlay_fallback(base_image, fallback_items)
+    rects = [payload["rect_pt"] for payload in page_payloads]
+    patch_rect = fitz.Rect(
+        min(rect[0] for rect in rects), min(rect[1] for rect in rects),
+        max(rect[2] for rect in rects), max(rect[3] for rect in rects))
+    patch_x0, patch_y0, patch_x1, patch_y1 = _pdf_rect_to_pixmap_bounds(
+        tuple(patch_rect), pixels_per_point, origin_x, origin_y)
+    patch_x0 = max(0, patch_x0)
+    patch_y0 = max(0, patch_y0)
+    patch_x1 = min(composed.width, patch_x1)
+    patch_y1 = min(composed.height, patch_y1)
+    if patch_x0 >= patch_x1 or patch_y0 >= patch_y1:
+        return
+    patch = composed.crop((patch_x0, patch_y0, patch_x1, patch_y1))
+    target_page.insert_image(patch_rect, stream=image_to_png_bytes(patch), overlay=True)
+
+
+def _pdf_rect_to_pixmap_bounds(rect_pt, pixels_per_point, origin_x=0, origin_y=0):
+    """
+    PDF point 矩形 -> 位图像素整数边界 (x0, y0, x1, y1)。
+
+    point ↔ 像素 的换算原来在导出检测与合成两处各写了一遍，这里收敛成单一来源，
+    避免以后改 render_dpi 时只改一处。
+    """
+    x0 = int(round(rect_pt[0] * pixels_per_point)) - origin_x
+    y0 = int(round(rect_pt[1] * pixels_per_point)) - origin_y
+    x1 = int(round(rect_pt[2] * pixels_per_point)) - origin_x
+    y1 = int(round(rect_pt[3] * pixels_per_point)) - origin_y
+    return (x0, y0, x1, y1)
+
+
+def _same_rendered_region(base_pixmap, stamped_pixmap, rect_pt, pixels_per_point):
+    """
+    判断插入底层印章后，其目标区域是否仍与原页完全相同（即被背景遮挡）。
+
+    base/stamped 可以是整页位图，也可以是「按 rect 裁剪过的局部位图」。局部位图时
+    pixmap.x / pixmap.y 已经是**缩放后的像素原点**（实测：clip=Rect(336,576,…) 在
+    matrix=2.0833 下得 .x=700, .y=1200），所以这里减去它即可把页面坐标的 rect_pt
+    换算到局部位图坐标，不需要再乘一次 pixels_per_point。
+    """
+    if (base_pixmap.width != stamped_pixmap.width
+            or base_pixmap.height != stamped_pixmap.height
+            or base_pixmap.x != stamped_pixmap.x
+            or base_pixmap.y != stamped_pixmap.y):
+        return False
+    base = Image.frombytes("RGB", (base_pixmap.width, base_pixmap.height), base_pixmap.samples)
+    stamped = Image.frombytes("RGB", (stamped_pixmap.width, stamped_pixmap.height),
+                              stamped_pixmap.samples)
+    x0, y0, x1, y1 = _pdf_rect_to_pixmap_bounds(
+        rect_pt, pixels_per_point, base_pixmap.x, base_pixmap.y)
+    x0 = max(0, x0)
+    y0 = max(0, y0)
+    x1 = min(base.width, x1)
+    y1 = min(base.height, y1)
+    if x0 >= x1 or y0 >= y1:
+        return False
+    bounds = (x0, y0, x1, y1)
+    return base.crop(bounds).tobytes() == stamped.crop(bounds).tobytes()
+
+
+def compose_underlay_fallback(base, stamp_items):
+    """印章被不透明页面背景遮挡时，按预览规则合成印章并恢复深色前景。"""
+    composed = base.convert("RGBA")
+    for item in stamp_items:
+        composed.alpha_composite(item["image"], (int(round(item["x"])),
+                                                   int(round(item["y"]))))
+    for item in stamp_items:
+        x0 = max(0, int(round(item["x"])))
+        y0 = max(0, int(round(item["y"])))
+        x1 = min(base.width, x0 + item["image"].width)
+        y1 = min(base.height, y0 + item["image"].height)
+        if x0 >= x1 or y0 >= y1:
+            continue
+        crop = base.crop((x0, y0, x1, y1)).convert("RGB")
+        mask = crop.convert("L").point(lambda value: 255 if value < 245 else 0)
+        composed.paste(crop, (x0, y0), mask)
+    return composed.convert("RGB")
 
 
 # ==================== 会话状态（非 GUI，可断言；修复 C） ====================
@@ -1125,11 +1521,17 @@ class RenderCore:
                         拖拽时 GUI 只移动 canvas 图元，不重新调用 payload
     """
 
-    def __init__(self, dpi=DEFAULT_RENDER_DPI, max_page_cache=8):
+    def __init__(self, dpi=DEFAULT_RENDER_DPI, max_page_cache=8,
+                 max_page_bytes=96 * 1024 * 1024):
         self.dpi = float(dpi)
         self.scale_factor = canvas_scale(self.dpi)
+        # 预先算好 Matrix：比每次传 dpi= 少构造一次 Matrix 对象
+        # （实测收益在噪声内，但写法更直接，也让 get_pixmap 参数与下面保持一致）
+        self._matrix = fitz.Matrix(self.scale_factor, self.scale_factor)
         self.max_page_cache = int(max_page_cache)
+        self.max_page_bytes = int(max_page_bytes)
         self._page_cache = OrderedDict()   # key -> PIL.Image
+        self._page_bytes = 0
         self._doc_token = None
         self.last_underlay_fallback = False
         self.stats = {"page_hit": 0, "page_miss": 0, "stamp_hit": 0, "stamp_miss": 0}
@@ -1137,6 +1539,7 @@ class RenderCore:
     # ---- 缓存管理 ----
     def invalidate(self):
         self._page_cache.clear()
+        self._page_bytes = 0
         self._doc_token = None
 
     def _check_doc(self, doc):
@@ -1146,7 +1549,10 @@ class RenderCore:
             self._doc_token = token
 
     def cache_info(self):
-        return {"cached_pages": len(self._page_cache), "stats": dict(self.stats),
+        return {"cached_pages": len(self._page_cache),
+                "cached_page_bytes": self._page_bytes,
+                "max_page_bytes": self.max_page_bytes,
+                "stats": dict(self.stats),
                 "stamp_cache": stamp_image_cache_info()}
 
     # ---- 页面位图 ----
@@ -1154,7 +1560,16 @@ class RenderCore:
         return (id(doc), int(page_index), self.dpi)
 
     def get_page_bitmap(self, doc, page_index):
-        """渲染（或命中缓存）某页的位图。"""
+        """
+        渲染（或命中缓存）某页的位图。
+
+        淘汰按「像素预算」（max_page_bytes）而不是固定页数：A4@150dpi 单页约 6.2 MB，
+        而 A0/A1 大幅面单页可达数十 MB，按页数淘汰会让内存失控。
+
+        注：曾尝试缓存 DisplayList 以省去内容流解析，但实测解析只占渲染耗时的约 6.5%
+        （解析 0.14 ms vs 光栅化 2.04 ms），冷渲染 30 页三种写法中位数都在 230 ms 上下，
+        差异在噪声内，因此不引入这层额外复杂度。
+        """
         self._check_doc(doc)
         key = self.page_bitmap_key(doc, page_index)
         hit = self._page_cache.get(key)
@@ -1164,12 +1579,25 @@ class RenderCore:
             return hit
         self.stats["page_miss"] += 1
         page = doc[min(max(0, int(page_index)), doc.page_count - 1)]
-        pix = page.get_pixmap(dpi=int(round(self.dpi)), colorspace=fitz.csRGB, alpha=False)
+        pix = page.get_pixmap(matrix=self._matrix, colorspace=fitz.csRGB, alpha=False)
         img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
         self._page_cache[key] = img
-        while len(self._page_cache) > self.max_page_cache:
-            self._page_cache.popitem(last=False)
+        self._page_bytes += pix.width * pix.height * 3
+        self._evict_page_cache()
         return img
+
+    def _evict_page_cache(self):
+        """按像素预算 + 页数上限双重淘汰（至少保留 1 页，避免刚放进就被踢掉）。"""
+        while len(self._page_cache) > 1 and (
+                len(self._page_cache) > self.max_page_cache
+                or self._page_bytes > self.max_page_bytes):
+            _, evicted = self._page_cache.popitem(last=False)
+            try:
+                self._page_bytes -= evicted.width * evicted.height * 3
+            except Exception:
+                self._page_bytes = 0
+        if not self._page_cache:
+            self._page_bytes = 0
 
     # ---- 公章位图（走全局 process 缓存，顺便统计命中） ----
     def get_stamp_bitmap(self, stamp):
@@ -1183,11 +1611,19 @@ class RenderCore:
 
     # ---- 一次渲染的完整载荷 ----
     def build_payload(self, doc, page_index, stamps, cross_fold_mode=False,
-                      cross_fold_stamp_index=None, cross_fold_offset=0.5):
+                      cross_fold_stamp_index=None, cross_fold_offset=0.5,
+                      options=None):
         """
         返回 {'page_bitmap', 'stamp_items': [{'tag','stamp_id','x','y','image','size','cross_fold'}]}
         x/y 为画布像素左上角；骑缝章时坐标由 cross_fold_geometry 算出（与导出同源）。
+
+        options 给定时覆盖三个骑缝章参数（与 export_pdf_with_stamps 共用同一套语义）。
         """
+        if options is not None:
+            opts = options.normalised()
+            cross_fold_mode = opts.cross_fold_mode
+            cross_fold_stamp_index = opts.cross_fold_stamp_index
+            cross_fold_offset = opts.cross_fold_offset
         self._check_doc(doc)
         page_index = min(max(0, int(page_index)), doc.page_count - 1)
         page = doc[page_index]
@@ -1245,8 +1681,7 @@ class RenderCore:
                     (item["y"] + image.height) / self.scale_factor,
                 )
                 page.insert_image(rect, stream=image_to_png_bytes(image), overlay=False)
-            pix = page.get_pixmap(dpi=int(round(self.dpi)),
-                                  colorspace=fitz.csRGB, alpha=False)
+            pix = page.get_pixmap(matrix=self._matrix, colorspace=fitz.csRGB, alpha=False)
             underlay = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
             base = payload["page_bitmap"]
             hidden_stamp = False
@@ -1264,22 +1699,7 @@ class RenderCore:
 
             # 某些 PDF 用整页白色背景对象覆盖底层图片；用页面深色内容恢复文字。
             self.last_underlay_fallback = True
-            composed = base.convert("RGBA")
-            for item in payload["stamp_items"]:
-                image = item["image"]
-                composed.alpha_composite(image, (int(round(item["x"])),
-                                                  int(round(item["y"]))))
-            for item in payload["stamp_items"]:
-                x0 = max(0, int(round(item["x"])))
-                y0 = max(0, int(round(item["y"])))
-                x1 = min(base.width, x0 + item["image"].width)
-                y1 = min(base.height, y0 + item["image"].height)
-                if x0 >= x1 or y0 >= y1:
-                    continue
-                crop = base.crop((x0, y0, x1, y1)).convert("RGB")
-                mask = crop.convert("L").point(lambda value: 255 if value < 245 else 0)
-                composed.paste(crop, (x0, y0), mask)
-            return composed.convert("RGB")
+            return compose_underlay_fallback(base, payload["stamp_items"])
         finally:
             temp_doc.close()
 
@@ -1289,7 +1709,7 @@ class RenderCore:
 class PDFStamper:
     def __init__(self, root, render_dpi=DEFAULT_RENDER_DPI):
         self.root = root
-        self.root.title("PDF盖章工具 v3.1")
+        self.root.title("PDF盖章工具 v3.2")
         self.root.geometry("1400x900")
 
         # 非界面状态全部放在 DocumentSession（可被测试直接驱动）
@@ -1306,6 +1726,7 @@ class PDFStamper:
         self.drag_last_x = 0
         self.drag_last_y = 0
         self.drag_moved = False
+        self.drag_vertical_only = False
 
         self._tk_img_cache = {}
         self.file_mode = "单文件模式"
@@ -1452,7 +1873,9 @@ class PDFStamper:
 
         ttk.Button(toolbar, text="打开PDF", command=self.open_pdf).pack(side=tk.LEFT, padx=2)
         ttk.Button(toolbar, text="加载公章", command=self.load_stamp).pack(side=tk.LEFT, padx=2)
-        ttk.Button(toolbar, text="导出PDF", command=self.export_pdf).pack(side=tk.LEFT, padx=2)
+        self.stamp_export_btn = ttk.Button(
+            toolbar, text="盖章并导出PDF", command=self.export_pdf)
+        self.stamp_export_btn.pack(side=tk.LEFT, padx=2)
         ttk.Button(toolbar, text="保存配置", command=self.save_config).pack(side=tk.LEFT, padx=2)
         ttk.Button(toolbar, text="加载配置", command=self.load_config).pack(side=tk.LEFT, padx=2)
 
@@ -1505,8 +1928,11 @@ class PDFStamper:
 
         self.cross_fold_btn = ttk.Button(toolbar, text="骑缝章: 关", command=self.toggle_cross_fold)
         self.cross_fold_btn.pack(side=tk.LEFT, padx=2)
+        self.copy_cross_fold_btn = ttk.Button(
+            toolbar, text="复制为骑缝章", command=self.add_cross_fold_copy)
+        self.copy_cross_fold_btn.pack(side=tk.LEFT, padx=2)
         self.confirm_cross_fold_btn = ttk.Button(
-            toolbar, text="确认骑缝盖章", command=self.confirm_cross_fold)
+            toolbar, text="确认骑缝位置", command=self.confirm_cross_fold)
         self.confirm_cross_fold_btn.pack(side=tk.LEFT, padx=2)
 
         self.layer_btn = ttk.Button(toolbar, text="公章: 底层", command=self.toggle_layer)
@@ -1534,7 +1960,7 @@ class PDFStamper:
         self.page_scope_var = tk.StringVar(value="全部页面")
         self.page_scope_combo = ttk.Combobox(
             scope_frame, textvariable=self.page_scope_var,
-            values=("全部页面", "首页", "尾页"), state="readonly", width=10)
+            values=("全部页面", "首页", "尾页", "不加印章"), state="readonly", width=10)
         self.page_scope_combo.pack(side=tk.LEFT, padx=5)
         self.page_scope_combo.bind("<<ComboboxSelected>>", self.on_page_scope_change)
 
@@ -1728,8 +2154,7 @@ class PDFStamper:
         if not filepath:
             filepath = filedialog.askopenfilename(
                 title="选择公章图片",
-                filetypes=[("图片文件", "*.png *.jpg *.jpeg *.bmp *.gif"), ("所有文件", "*.*")]
-            )
+                filetypes=list(STAMP_FILE_DIALOG_TYPES))
         if not filepath:
             return None
         try:
@@ -1749,6 +2174,32 @@ class PDFStamper:
         self.save_history()
         self.set_status("已加载: %s" % stamp.name)
         return stamp
+
+    def add_cross_fold_copy(self):
+        """从当前公章创建独立骑缝章副本，不改变原章的位置或参数。"""
+        source = self.active_stamp()
+        if source is None:
+            messagebox.showwarning("提示", "请先选择要复制的公章")
+            return None
+        copy = self.session.add_stamp(source.img.copy(), "%s（骑缝章）" % source.name)
+        copy.scale = source.scale
+        copy.opacity = source.opacity
+        copy.rotation = source.rotation
+        copy.page_scope = "all"
+        copy.source_path = source.source_path
+        copy.is_cross_fold = True
+        copy.cross_fold_offset = 0.5
+        self.cross_fold_mode = True
+        self.cross_fold_stamp_index = self.active_stamp_idx
+        self.session.cross_fold_mode = True
+        self.session.cross_fold_stamp_index = self.active_stamp_idx
+        self.sync_sliders_to_active()
+        self.sync_cross_fold_controls()
+        self.update_stamp_list()
+        self.render_page()
+        self.save_history()
+        self.set_status("已创建独立骑缝章，可单独调整偏移后盖章")
+        return copy
 
     def delete_stamp(self):
         selection = self.stamp_listbox.curselection()
@@ -1808,13 +2259,17 @@ class PDFStamper:
         self.opacity_label.config(text="%d%%" % int(stamp.opacity * 100))
         self.rotation_var.set(stamp.rotation)
         self.rotation_label.config(text="%d°" % stamp.rotation)
-        scope_labels = {"all": "全部页面", "first": "首页", "last": "尾页"}
+        scope_labels = {"all": "全部页面", "first": "首页", "last": "尾页",
+                "none": "不加印章"}
         self.page_scope_var.set(scope_labels.get(stamp.page_scope, "全部页面"))
 
     def sync_cross_fold_controls(self):
         stamp = self.active_stamp()
         enabled = bool(stamp is not None and getattr(stamp, "is_cross_fold", False))
         self.cross_fold_mode = enabled
+        self.cross_fold_stamp_index = self.active_stamp_idx if enabled else None
+        self.session.cross_fold_mode = enabled
+        self.session.cross_fold_stamp_index = self.cross_fold_stamp_index
         self.cross_fold_mode_var.set("加盖骑缝章" if enabled else "普通盖章")
         self.cross_fold_btn.config(text="骑缝章: 开" if enabled else "骑缝章: 关")
         self.confirm_cross_fold_btn.config(
@@ -1823,13 +2278,21 @@ class PDFStamper:
             self.cross_fold_offset = stamp.cross_fold_offset
             self.offset_var.set(stamp.cross_fold_offset)
             self.offset_label.config(text="%d%%" % int(stamp.cross_fold_offset * 100))
+            scope_modes = {"all": "全部页面加印章", "first": "首页加印章",
+                           "last": "尾页加印章", "none": "不加印章"}
+            self.seal_mode = scope_modes.get(stamp.page_scope, "全部页面加印章")
+            self.seal_mode_var.set(self.seal_mode)
+        self.stamp_mode_enabled = True
+        self.session.stamp_mode_enabled = True
 
     def on_page_scope_change(self, event=None):
         stamp = self.active_stamp()
         if stamp is None:
             return
-        scope_values = {"全部页面": "all", "首页": "first", "尾页": "last"}
+        scope_values = {"全部页面": "all", "首页": "first", "尾页": "last",
+                "不加印章": "none"}
         stamp.page_scope = scope_values.get(self.page_scope_var.get(), "all")
+        self.sync_cross_fold_controls()
         self.render_page()
         self.save_history()
 
@@ -1837,11 +2300,20 @@ class PDFStamper:
         self.stamp_listbox.delete(0, tk.END)
         for i, stamp in enumerate(self.stamps):
             marker = "► " if i == self.active_stamp_idx else "  "
-            self.stamp_listbox.insert(tk.END, "%s%s" % (marker, stamp.name))
+            kind = "骑缝章" if stamp.is_cross_fold else "公章"
+            self.stamp_listbox.insert(tk.END, "%s[%s] %s" % (marker, kind, stamp.name))
         if self.stamps and 0 <= self.active_stamp_idx < len(self.stamps):
             self.stamp_listbox.selection_set(self.active_stamp_idx)
 
     # ==================== 渲染 ====================
+
+    def export_options(self):
+        """当前预览/导出共用的一组选项（预览与导出必然同源，避免两处参数漂移）。"""
+        return ExportOptions(
+            cross_fold_mode=self.cross_fold_mode,
+            cross_fold_stamp_index=self.cross_fold_stamp_index,
+            cross_fold_offset=self.cross_fold_offset,
+            underlay=self.stamp_underlay)
 
     def render_page(self):
         """
@@ -1854,10 +2326,8 @@ class PDFStamper:
             return None
         payload = self.core.build_payload(
             self.pdf_doc, self.current_page,
-            self.stamps if self.stamp_mode_enabled else [],
-            cross_fold_mode=self.cross_fold_mode,
-            cross_fold_stamp_index=self.cross_fold_stamp_index,
-            cross_fold_offset=self.cross_fold_offset)
+            self.stamps,
+            options=self.export_options())
 
         zoom = self.view_zoom
         bitmap = payload["page_bitmap"]
@@ -1874,8 +2344,9 @@ class PDFStamper:
             image = item["image"]
             if self.stamp_underlay:
                 image = Image.new("RGBA", item["size"], (0, 0, 0, 0))
-            image = self._display_image(image, zoom)
-            photo = self._tk_photo("stamp", id(item["image"]), image)
+            # 一步缩放到显示尺寸（payload 里的图已含 stamp.scale；这里只叠画布缩放）
+            image = display_scale_cache(image, zoom)
+            photo = self._tk_photo("stamp", id(image), image)
             tags = [item["tag"], "stamp_item", item["kind"]]
             if item["index"] == self.active_stamp_idx:
                 tags.append("active")
@@ -1938,18 +2409,21 @@ class PDFStamper:
         self.update_stamp_list()
         self.sync_sliders_to_active()
         if not drag_allowed_for_tags(clicked_tags):
-            # 该图元是骑缝章切片：位置由页序 + 偏移滑块决定 -> 明确提示，而不是拖了没反应
             self.is_dragging = False
             self.drag_item_tag = None
-            self.set_status("骑缝章位置由页序自动决定，请用「骑缝章配置 - 偏移」调整位置")
+            self.set_status("该印章当前不可拖动")
             return
         self.is_dragging = True
         self.drag_item_tag = "stamp_%d" % stamp_idx
+        # 骑缝章的水平位置由「页序 + 偏移」算出，拖动只改垂直位置
+        self.drag_vertical_only = "cross_fold" in clicked_tags
         stamp_x, stamp_y = stamp.position_for_page(self.current_page)
         self.drag_start_x = canvas_x - stamp_x * self.view_zoom
         self.drag_start_y = canvas_y - stamp_y * self.view_zoom
         self.drag_last_x, self.drag_last_y = canvas_x, canvas_y
         self.drag_moved = False
+        if self.drag_vertical_only:
+            self.set_status("骑缝章：拖动调整上下位置，左右位置请用「骑缝章配置 - 偏移」")
         if self.stamp_underlay:
             item = self.canvas.find_withtag(self.drag_item_tag)
             if item:
@@ -1974,6 +2448,9 @@ class PDFStamper:
         canvas_y = self.canvas.canvasy(event.y)
         stamp_x = (canvas_x - self.drag_start_x) / self.view_zoom
         stamp_y = (canvas_y - self.drag_start_y) / self.view_zoom
+        if self.drag_vertical_only:
+            # 骑缝章：只应用垂直分量，水平位置仍由「页序 + 偏移」决定
+            stamp_x = stamp.position_for_page(self.current_page)[0]
         stamp.set_position_for_page(self.current_page, stamp_x, stamp_y)
         dx = canvas_x - self.drag_last_x
         dy = canvas_y - self.drag_last_y
@@ -1983,12 +2460,13 @@ class PDFStamper:
             self.drag_moved = True
 
     def on_mouse_up(self, event):
-        """松手才重绘 + 存历史（骑缝章位置由几何算出，需要重绘复位）。"""
+        """松手才重绘 + 存历史（骑缝章的水平位置由几何算出，需要重绘复位）。"""
         if not self.is_dragging:
             return
         self.is_dragging = False
         moved = self.drag_moved
         self.drag_item_tag = None
+        self.drag_vertical_only = False
         self.render_page()
         if moved:
             self.save_history()
@@ -2195,8 +2673,12 @@ class PDFStamper:
 
     def on_seal_mode_change(self, event=None):
         mode = self.seal_mode_var.get()
+        stamp = self.active_stamp()
+        if stamp is None:
+            self.seal_mode_var.set(self.seal_mode)
+            return
         self.seal_mode = mode
-        self.stamp_mode_enabled = mode != "不加印章"
+        self.stamp_mode_enabled = True
         self.session.seal_mode = self.seal_mode
         self.session.stamp_mode_enabled = self.stamp_mode_enabled
         scope = {
@@ -2204,10 +2686,12 @@ class PDFStamper:
             "尾页加印章": "last",
             "加盖印章": "all",  # 兼容旧配置
             "全部页面加印章": "all",
+            "不加印章": "none",
         }.get(mode)
         if scope is not None:
-            for stamp in self.stamps:
-                stamp.page_scope = scope
+            stamp.page_scope = scope
+            self.page_scope_var.set({"all": "全部页面", "first": "首页",
+                                     "last": "尾页", "none": "不加印章"}[scope])
         self.render_page()
         self.save_history()
         self.set_status("印章模式: %s" % mode)
@@ -2363,13 +2847,17 @@ class PDFStamper:
                     legacy_stamp.cross_fold_offset = self.cross_fold_offset
             self.stamp_underlay = bool(data.get("stamp_underlay", True))
             self.seal_mode = str(data.get("seal_mode", "全部页面加印章"))
-            self.stamp_mode_enabled = bool(data.get("stamp_mode_enabled", True))
+            legacy_stamps_disabled = not bool(data.get("stamp_mode_enabled", True))
+            if legacy_stamps_disabled:
+                for stamp in restored:
+                    stamp.page_scope = "none"
+            self.stamp_mode_enabled = True
             self.session.cross_fold_mode = self.cross_fold_mode
             self.session.cross_fold_stamp_index = self.cross_fold_stamp_index
             self.session.cross_fold_offset = self.cross_fold_offset
             self.session.stamp_underlay = self.stamp_underlay
             self.session.seal_mode = self.seal_mode
-            self.session.stamp_mode_enabled = self.stamp_mode_enabled
+            self.session.stamp_mode_enabled = True
             self.update_stamp_list()
             self.sync_mode_controls()
             self.render_page()
@@ -2400,15 +2888,14 @@ class PDFStamper:
         if not save_path:
             return None
         try:
-            stamps = self.stamps if self.stamp_mode_enabled else []
+            stamps = self.stamps
             report = export_pdf_with_stamps(
                 self.pdf_doc, stamps, save_path,
                 scale_factor=self.scale_factor,
                 # 新配置以每个公章自己的 is_cross_fold 为准；旧配置已在加载时迁移。
-                cross_fold_mode=False,
-                cross_fold_stamp_index=None,
-                cross_fold_offset=0.5,
-                underlay=self.stamp_underlay)
+                options=ExportOptions(cross_fold_mode=False,
+                                      cross_fold_stamp_index=None,
+                                      underlay=self.stamp_underlay))
         except Exception as e:
             messagebox.showerror("错误", f"导出失败: {str(e)}")
             return None
@@ -2420,7 +2907,7 @@ class PDFStamper:
         """使用当前公章配置批量导出已选择的 PDF，返回逐文件结果。"""
         reports = []
         failures = []
-        stamps = self.stamps if self.stamp_mode_enabled else []
+        stamps = self.stamps
         output_paths = batch_output_paths(self.batch_paths, output_dir)
         existing_paths = [path for path in output_paths if os.path.exists(path)]
         duplicate_paths = len(output_paths) != len(set(output_paths))
@@ -2465,10 +2952,9 @@ class PDFStamper:
                 report = export_pdf_with_stamps(
                     doc, stamps, output_path,
                     scale_factor=self.scale_factor,
-                    cross_fold_mode=False,
-                    cross_fold_stamp_index=None,
-                    cross_fold_offset=0.5,
-                    underlay=self.stamp_underlay)
+                    options=ExportOptions(cross_fold_mode=False,
+                                          cross_fold_stamp_index=None,
+                                          underlay=self.stamp_underlay))
                 reports.append(report)
             except Exception as exc:
                 failures.append((filepath, str(exc)))
