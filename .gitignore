@@ -20,3 +20,6 @@ run_*.txt
 .idea/
 Thumbs.db
 desktop.ini
+
+# ===== 助手工作区（会话记忆，非项目源码）=====
+.workbuddy-ai/
